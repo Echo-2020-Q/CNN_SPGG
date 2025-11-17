@@ -3,8 +3,9 @@ PlannerNet: 卷积式策略 + 价值网络，负责把环境状态映射为每�
 
 可以把它理解成“制度设计者的大脑”：
 
-- 输入 state: tensor shape (B, C=5, L, L)
-  - 通道顺序为 [C_now, D_now, C_prev, D_prev, P_center]，由 env.get_state 构造。
+- 输入 state: tensor shape (B, C=3, L, L)
+  - 通道顺序为 [Stra_now, Stra_prev, P_center]，由 env.get_state 构造；
+  - Stra_* 为 0/1（合作者=1，背叛者=0）。
 - 输出 alpha: (B, 5, L, L)
   - 本实现把策略头输出经过 softplus，得到严格 >0 的参数；
   - 这些参数可视为 Dirichlet 的浓度参数 (alpha)，适用于在动作空间为“概率向量”的场景；
@@ -27,7 +28,7 @@ import torch.nn.functional as F
 
 
 class PlannerNet(nn.Module):
-    def __init__(self, in_channels=5, base_channels=32):
+    def __init__(self, in_channels=3, base_channels=32):
         super().__init__()
 
         # 主干卷积网络：提取局部与全局特征
@@ -60,7 +61,7 @@ class PlannerNet(nn.Module):
     def forward(self, x):
         """
         前向计算：
-        输入 x: (B, 5, L, L)
+        输入 x: (B, 3, L, L)
         返回 (alpha, value)
           - alpha: (B, 5, L, L), 所有元素 > 0，可作为 Dirichlet 的浓度参数
           - value: (B,)         状态值

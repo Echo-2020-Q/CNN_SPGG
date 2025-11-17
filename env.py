@@ -60,24 +60,20 @@ class PublicGoodsEnv:
     def get_state(self):
         """
         构造 CNN 输入状态（提供给 PlannerNet）：
-        1) 当前策略：C_now, D_now（one-hot 两通道）
-        2) 上一轮策略：C_prev, D_prev（方便网络感知“策略变化趋势”）
+        1) 当前策略：Stra_now（合作者=1，背叛者=0）
+        2) 上一轮策略：Stra_prev（合作者=1，背叛者=0）
         3) 当前公共池：P_center（以每个格点为中心小组的 P = r * n_c）
 
-        输出 shape: (5, L, L)
+        输出 shape: (3, L, L)
         """
-        # 当前轮
-        C_now = (self.strategy == 1).astype(np.float32)
-        D_now = (self.strategy == 0).astype(np.float32)
-
-        # 上一轮
-        C_prev = (self.prev_strategy == 1).astype(np.float32)
-        D_prev = (self.prev_strategy == 0).astype(np.float32)
+        # 当前轮与上一轮的策略（单通道布尔 -> float32）
+        stra_now = (self.strategy == 1).astype(np.float32)
+        stra_prev = (self.prev_strategy == 1).astype(np.float32)
 
         # 当前公共池（以各点为中心的小组的P）
         P_map = self.P_center.astype(np.float32)
 
-        state = np.stack([C_now, D_now, C_prev, D_prev, P_map], axis=0)
+        state = np.stack([stra_now, stra_prev, P_map], axis=0)
         return state
 
     def _update_strategy_fermi(self, beta=1.0):
@@ -124,7 +120,7 @@ class PublicGoodsEnv:
         π_field: shape (L, L, 5)，每个格点的五维分配比例（mid, up, down, left, right）。
 
         返回:
-            new_state: 下一时刻的状态 (5, L, L)，用于下一步 CNN 输入；
+            new_state: 下一时刻的状态 (3, L, L)，用于下一步 CNN 输入；
             planner_reward: 本回合 planner 的奖励；
             info: 一些统计量，用于观测系统状态（如合作率等）。
         """

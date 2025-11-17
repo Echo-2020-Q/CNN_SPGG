@@ -7,7 +7,7 @@ global_trainer.py (Learner + launcher)
 - environment: `PublicGoodsEnv`
   - 定义公共物品博弈规则和 Fermi 策略演化规则；
 - policy/value network: `PlannerNet`
-  - 把 env.get_state() 的 5 通道状态映射成 Dirichlet 参数 alpha 和 value；
+  - 把 env.get_state() 的 3 通道状态映射成 Dirichlet 参数 alpha 和 value；
 - actors (在 worker.py 中实现):
   - 多个进程并行运行环境 + 策略，采集轨迹；
   - 每个 actor 把 T_actor 步轨迹打包放入 `traj_queue`；

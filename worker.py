@@ -8,7 +8,7 @@ worker.py (Actor 实现)
 
 关键数据格式（在 trajectory 中）：
 - states: numpy array (T, C, L, L)
-  - 每一步的棋盘状态，由 env.get_state() 产生；
+  - 每一步的棋盘状态，由 env.get_state() 产生；当前 C=3，对应 [Stra_now, Stra_prev, P_center]
 - last_state: numpy array (C, L, L)
   - 用于 bootstrap 目标值 V(s_T)；
 - actions: numpy array (T, L, L, 5)
