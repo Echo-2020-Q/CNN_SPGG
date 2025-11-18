@@ -39,17 +39,22 @@ from worker import actor_loop
 from worker_utils import compute_vtrace_loss
 from env import PublicGoodsEnv   # 仅用于 L 参数
 
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
 
 def learner_loop(
-    global_net,
-    traj_queue,
-    device="cpu",
-    gamma=0.99,
-    rho_bar=1.0,
-    c_bar=1.0,
-    entropy_beta=0.01,
-    lr=1e-4,
-    max_updates=1000,
+    global_net,         # 共享的全局网络（PlannerNet），在此处被训练更新
+    traj_queue,         # multiprocessing.Queue，Actor 往里塞轨迹，Learner 从中取数据
+    device="cpu",       # 训练所用的设备，如 "cpu" 或 "cuda:0"
+    gamma=0.99,         # 折扣因子 γ，用于 V-trace / 价值回报的时间折扣
+    rho_bar=1.0,        # V-trace 中重要性比率 ρ_t 的截断上限（off-policy 校正强度）
+    c_bar=1.0,          # V-trace 中权重 c_t 的截断上限（控制 bootstrap 校正强度）
+    entropy_beta=0.01,  # 策略熵正则的权重系数，越大越鼓励随机性（探索）
+    lr=1e-4,            # 学习率，用于 Adam 优化器
+    max_updates=1000,   # Learner 最大更新次数（处理多少条轨迹 / 做多少次梯度更新）
 ):
     """
     Learner 主循环：
@@ -62,6 +67,13 @@ def learner_loop(
     """
     optimizer = torch.optim.Adam(global_net.parameters(), lr=lr)
 
+    # 记录训练过程中的指标，方便后续打印与绘图
+    mean_reward_hist = []
+    mean_fC_hist = []
+    loss_hist = []
+    policy_loss_hist = []
+    value_loss_hist = []
+
     for update_idx in range(max_updates):
         batch = traj_queue.get()
 
@@ -71,6 +83,7 @@ def learner_loop(
         actions_np = batch["actions"]        # numpy (T, L, L, 5)
         rewards = batch["rewards"]           # numpy (T,)
         dones = batch["dones"]               # numpy (T,)
+        f_Cs = batch.get("f_Cs", None)       # numpy (T,) 每步合作率（若有）
         behav_log_probs_np = batch["behavior_log_probs"]  # numpy (T,)
 
         T, C, L, W = states.shape
@@ -132,9 +145,60 @@ def learner_loop(
         torch.nn.utils.clip_grad_norm_(global_net.parameters(), 40.0)
         optimizer.step()
 
+        # 累积指标
+        loss_hist.append(loss.item())
+        policy_loss_hist.append(pl)
+        value_loss_hist.append(vl)
+        mean_reward_hist.append(float(rewards.mean()))
+        if f_Cs is not None:
+            mean_fC_hist.append(float(f_Cs.mean()))
+        else:
+            mean_fC_hist.append(float("nan"))
+
+        # 定期打印训练状态
         if update_idx % 10 == 0:
-            print(f"[Learner] update {update_idx}, loss={loss.item():.4f}, "
-                  f"policy_loss={pl:.4f}, value_loss={vl:.4f}")
+            print(
+                f"[Learner] update {update_idx}, "
+                f"loss={loss.item():.4f}, policy_loss={pl:.4f}, value_loss={vl:.4f}, "
+                f"mean_reward={mean_reward_hist[-1]:.4f}, mean_fC={mean_fC_hist[-1]:.4f}"
+            )
+
+    # 训练结束后，如可用 matplotlib，则画图保存到当前目录
+    if plt is not None and len(loss_hist) > 0:
+        xs = list(range(len(loss_hist)))
+
+        plt.figure()
+        plt.plot(xs, mean_reward_hist, label="mean reward")
+        plt.xlabel("update")
+        plt.ylabel("reward")
+        plt.title("Mean reward per update")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("reward_curve.png")
+        plt.close()
+
+        plt.figure()
+        plt.plot(xs, mean_fC_hist, label="mean f_C")
+        plt.xlabel("update")
+        plt.ylabel("cooperation rate")
+        plt.title("Mean cooperation rate f_C per update")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("fC_curve.png")
+        plt.close()
+
+        plt.figure()
+        plt.plot(xs, loss_hist, label="total loss")
+        plt.plot(xs, policy_loss_hist, label="policy loss")
+        plt.plot(xs, value_loss_hist, label="value loss")
+        plt.xlabel("update")
+        plt.ylabel("loss")
+        plt.title("Loss curves")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("loss_curves.png")
+        plt.close()
 
 
 def train(
@@ -143,6 +207,8 @@ def train(
     r=1.4,
     device="cpu",
     max_updates=1000,
+    episode_length=500,
+    T_actor=20,
 ):
     """
     训练入口：
@@ -161,7 +227,7 @@ def train(
     for i in range(num_actors):
         p = mp.Process(
             target=actor_loop,
-            args=(i, global_net, traj_queue, device, L, r, 20),  # T_actor=20
+            args=(i, global_net, traj_queue, device, L, r, T_actor, episode_length),
         )
         p.daemon = True
         p.start()
@@ -182,4 +248,12 @@ def train(
 
 if __name__ == "__main__":
     mp.set_start_method("spawn")
-    train(num_actors=4, L=16, r=1.4, device="cpu", max_updates=200)
+    train(
+        num_actors=4,
+        L=40,
+        r=4,
+        device="cpu",
+        max_updates=10000,
+        episode_length=100,
+        T_actor=10,
+    )

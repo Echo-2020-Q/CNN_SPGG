@@ -17,7 +17,7 @@ class PublicGoodsEnv:
     - 这个向量控制以 (i,j) 为中心那一组公共池如何在 5 个个体之间分配；
     - 通过学习 π_field，planner 试图引导系统形成高合作率 / 高总体收益的制度。
     """
-    def __init__(self, L=32, r=1.4, R_decay=0.10, use_cumulative_planner_reward=True):
+    def __init__(self, L=32, r=1.4, R_decay=0.10, use_cumulative_planner_reward=True, episode_length=500):
         """
         Args:
             L: 网格边长
@@ -55,6 +55,10 @@ class PublicGoodsEnv:
 
         # 预先缓存 [0, L) 的索引数组，后续做周期边界映射时无需重复构建
         self.idxs = np.arange(L)
+
+        # Episode 相关：最大的演化步数 T_max（episode_length），以及当前步计数 t
+        self.episode_length = int(episode_length)
+        self.t = 0
     
     # ==============================================================
     def get_state(self):
@@ -122,6 +126,7 @@ class PublicGoodsEnv:
         返回:
             new_state: 下一时刻的状态 (3, L, L)，用于下一步 CNN 输入；
             planner_reward: 本回合 planner 的奖励；
+            done: 是否到达本 episode 结束（达到最大演化步数 T_max）；
             info: 一些统计量，用于观测系统状态（如合作率等）。
         """
         L, r = self.L, self.r
@@ -200,14 +205,20 @@ class PublicGoodsEnv:
         # --------- 4. 更新个体策略：Fermi 复制规则 ----------
         self._update_strategy_fermi(beta=1.0)
 
+        # Episode 步数推进，并判断是否终止（达到最大演化步数）
+        self.t += 1
+        done = self.t >= self.episode_length
+
         info = {
             "avg_R": avg_R_new,
             "avg_r": new_r.mean(),
             "avg_net": avg_net,           # 本回合的平均净收益（total_P - 5*#C）/L^2
             "f_C":  self.strategy.mean(),  # 合作率
+            "t": self.t,
+            "done": done,
         }
 
-        return self.get_state(), planner_reward, info
+        return self.get_state(), planner_reward, done, info
 
     def reset(self):
         # 重置策略、资源、r_t、P_center、prev_strategy 等
@@ -218,6 +229,8 @@ class PublicGoodsEnv:
         self.P_center.fill(0.0)
         # 重置 planner 累计奖励（如果有使用累计式奖励）
         self.planner_cum_reward = 0.0
+        # 重置 episode 步数计数
+        self.t = 0
         return self.get_state()
 
 

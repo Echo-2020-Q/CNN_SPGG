@@ -33,7 +33,7 @@ from env import PublicGoodsEnv
 from planner_net import PlannerNet
 
 
-def actor_loop(actor_id, global_net, traj_queue, device, L=32, r=1.4, T_actor=20):
+def actor_loop(actor_id, global_net, traj_queue, device, L=32, r=1.4, T_actor=20, episode_length=500):
     """
     单个 Actor 进程的主循环。
 
@@ -56,7 +56,7 @@ def actor_loop(actor_id, global_net, traj_queue, device, L=32, r=1.4, T_actor=20
     torch.manual_seed(1234 + actor_id)
     np.random.seed(1234 + actor_id)
 
-    env = PublicGoodsEnv(L=L, r=r)
+    env = PublicGoodsEnv(L=L, r=r, episode_length=episode_length)
     local_net = PlannerNet().to(device)
 
     #从环境中获取这一步的状态
@@ -71,9 +71,11 @@ def actor_loop(actor_id, global_net, traj_queue, device, L=32, r=1.4, T_actor=20
         actions = []             # 每步保存 (L, L, 5) 的 pi_field（Dirichlet 采样结果）
         behav_log_probs = []     # 每步行为策略的标量 log_prob（对所有 group 的 log_prob 取均值）
         rewards = []             # 每步环境返回给 planner 的奖励（标量）
-        dones = []               # 每步的终止标记，这里暂时都为 False（未考虑 episode 结束）
+        dones = []               # 每步的终止标记，来自 env.step 的 done（episode 是否结束）
         entropies = []           # 每步策略的平均熵（对所有 group 的熵取均值）
+        f_cs = []                # 每步的合作率 f_C（从 env.step 返回的 info 中读取）
 
+        done = False             # 标记当前轨迹内是否在某一步结束了 episode
         for t in range(T_actor):
             # 把 numpy state 转成 tensor 送进 local_net
             s_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)  # (1, C, L, L)
@@ -81,43 +83,66 @@ def actor_loop(actor_id, global_net, traj_queue, device, L=32, r=1.4, T_actor=20
             with torch.no_grad():
                 # local_net 输出 alpha（Dirichlet 的浓度参数）和 value（未使用于采样）
                 alpha, value = local_net(s_tensor)         # alpha: (1,5,L,L)
-                B, C5, H, W = alpha.shape                  # B=1, C5=5, H=W=L
+                B, C, H, W = alpha.shape                   # B=1, C=5, H=W=L
 
                 # 准备构造 N_groups 个 Dirichlet 分布（每个 group 一个），先 reshape
-                alpha_flat = alpha.view(B, C5, -1).permute(0, 2, 1)  # (1, N_groups, 5)
-                alpha_flat = alpha_flat[0]                            # (N_groups, 5)
+                alpha_flat = alpha.view(B, C, -1).permute(0, 2, 1)   # (1, N_groups, 5)
+                alpha_flat = alpha_flat[0]                           # (N_groups, 5)
 
-                # 构造 batched Dirichlet：每个 group 一个参数 alpha
+                # 构造 batched Dirichlet：每个 group 一个参数 alpha ; dist=distribution（分布）
                 dist = Dirichlet(alpha_flat)                          # N_groups 个 Dirichlet(5)
 
                 # 采样动作：actions_flat 为 (N_groups, 5)，即每个 group 的概率向量
                 actions_flat = dist.sample()                          # (N_groups, 5)
 
-                # 计算行为策略的 log_prob 与熵，按 group 取平均得到每步的标量
+                # 这一段是在把“每个格点上的信息”压缩成“当前这一步的两个标量”：
+                #行为策略在这一步的平均 log_prob（标量）
+                #行为策略在这一步的平均熵（标量）
                 log_probs_flat = dist.log_prob(actions_flat)          # (N_groups,)
-                behav_log_prob = log_probs_flat.mean()                # 标量
+                # dist 里有 N_groups = L*L 个 Dirichlet 分布（每个格点一个）。
+                # actions_flat 是 (N_groups, 5)，每行是该格点采样到的 5 维概率向量。
+                # log_prob 对每个格点算 log π(a_t^group | s_t)，得到一个长度为 N_groups 的向量。
 
+                behav_log_prob = log_probs_flat.mean()                # 标量
+                # 对所有格点的 log_prob 求平均，变成一个标量。
+                # 这个标量就代表“在这一步 t，整张棋盘的平均行为 log_prob”。
+                # 存到轨迹里时，用这个标量就够了，Learner 的 V-trace 也是按标量来算的。
+
+                #对每个格点的 Dirichlet 分布算熵，得到每个格点的“策略不确定性”。
+                #再对所有格点求平均，得到这一步 t 的“平均策略熵”标量 entropy_t。
+                #这个标量后面会用在熵正则（鼓励策略不要太确定，多探索一些）。
                 entropy_flat = dist.entropy()                         # (N_groups,)
                 entropy_t = entropy_flat.mean()                       # 标量
 
                 # 恢复成 (L,L,5) 的 pi_field，直接传给 env
-                pi_field = actions_flat.view(H, W, C5)                # (L,L,5)
+                pi_field = actions_flat.view(H, W, C)                 # (L,L,5)
 
             # env 真正执行 Dirichlet 采样出的 π_field
             pi_field_np = pi_field.cpu().numpy()
-            next_state, reward, info = env.step(pi_field_np)
+            next_state, reward, done, info = env.step(pi_field_np)
 
             # 记录轨迹数据
             states.append(state)
             actions.append(pi_field_np)                     # (L,L,5)
             behav_log_probs.append(behav_log_prob.cpu().item())
             rewards.append(float(reward))
-            dones.append(False)                             # 这里暂不考虑 episode 终止
+            dones.append(bool(done))                        # 记录当前步是否 episode 结束
             entropies.append(entropy_t.cpu().item())
+            f_cs.append(float(info.get("f_C", 0.0)))        # 记录当前步的合作率 f_C
 
+            # 更新下一步要用的状态
             state = next_state
 
+            # 如本步 episode 结束，则提前截断轨迹
+            if done:
+                break
+
+        # 轨迹最后一个状态（用于 bootstrap），就是循环结束时的 state
         last_state = state
+
+        # 如果 episode 已经结束，则在开始下一条轨迹前重置环境
+        if done:
+            state = env.reset()
 
         # 打包轨迹，注意使用 numpy / 基本类型，方便通过多进程队列传输与在 Learner 端处理
         traj = {
@@ -126,8 +151,9 @@ def actor_loop(actor_id, global_net, traj_queue, device, L=32, r=1.4, T_actor=20
             "actions": np.stack(actions, axis=0),          # (T, L, L, 5) 每步每个格点的 Dirichlet 采样结果 pi_field
             "behavior_log_probs": np.array(behav_log_probs, dtype=np.float32),  # (T,)  每步行为策略的标量 log_prob
             "rewards": np.array(rewards, dtype=np.float32),                     # (T,)  每步的 reward 序列
-            "dones": np.array(dones, dtype=bool),                               # (T,)  每步是否终止，这里全为 False
+            "dones": np.array(dones, dtype=bool),                               # (T,)  每步是否终止（True 表示 episode 结束）
             "entropies": np.array(entropies, dtype=np.float32),                 # (T,)  每步策略平均熵的时间序列
+            "f_Cs": np.array(f_cs, dtype=np.float32),                           # (T,)  每步合作率的时间序列
         }
 
         traj_queue.put(traj)
