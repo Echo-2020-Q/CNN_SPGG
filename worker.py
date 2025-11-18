@@ -59,18 +59,20 @@ def actor_loop(actor_id, global_net, traj_queue, device, L=32, r=1.4, T_actor=20
     env = PublicGoodsEnv(L=L, r=r)
     local_net = PlannerNet().to(device)
 
+    #从环境中获取这一步的状态
     state = env.get_state()
 
     while True:
         # 1. 同步参数（pull）
         local_net.load_state_dict(global_net.state_dict())
 
-        states = []
-        actions = []             # 每步保存 (L,L,5) 的 pi_field（Dirichlet 采样结果）
-        behav_log_probs = []     # 每步行为策略的 scalar log_prob（对所有 group 取均值）
-        rewards = []
-        dones = []
-        entropies = []
+        # 下面这些列表用于在当前采样周期内，按时间顺序缓存每一步的轨迹数据
+        states = []              # 每一步的环境状态 state，形状为 (C, L, L)
+        actions = []             # 每步保存 (L, L, 5) 的 pi_field（Dirichlet 采样结果）
+        behav_log_probs = []     # 每步行为策略的标量 log_prob（对所有 group 的 log_prob 取均值）
+        rewards = []             # 每步环境返回给 planner 的奖励（标量）
+        dones = []               # 每步的终止标记，这里暂时都为 False（未考虑 episode 结束）
+        entropies = []           # 每步策略的平均熵（对所有 group 的熵取均值）
 
         for t in range(T_actor):
             # 把 numpy state 转成 tensor 送进 local_net
@@ -117,15 +119,15 @@ def actor_loop(actor_id, global_net, traj_queue, device, L=32, r=1.4, T_actor=20
 
         last_state = state
 
-        # 打包轨迹，注意序列化友好类型（numpy arrays / primitive types）
+        # 打包轨迹，注意使用 numpy / 基本类型，方便通过多进程队列传输与在 Learner 端处理
         traj = {
-            "states": np.stack(states, axis=0),            # (T, C, L, L)
-            "last_state": last_state,                      # (C, L, L)
-            "actions": np.stack(actions, axis=0),          # (T, L, L, 5)
-            "behavior_log_probs": np.array(behav_log_probs, dtype=np.float32),  # (T,)
-            "rewards": np.array(rewards, dtype=np.float32),
-            "dones": np.array(dones, dtype=bool),
-            "entropies": np.array(entropies, dtype=np.float32),                 # (T,)
+            "states": np.stack(states, axis=0),            # (T, C, L, L)  每步的环境状态序列
+            "last_state": last_state,                      # (C, L, L)    轨迹最后一步的状态，用于 bootstrap V(s_T)
+            "actions": np.stack(actions, axis=0),          # (T, L, L, 5) 每步每个格点的 Dirichlet 采样结果 pi_field
+            "behavior_log_probs": np.array(behav_log_probs, dtype=np.float32),  # (T,)  每步行为策略的标量 log_prob
+            "rewards": np.array(rewards, dtype=np.float32),                     # (T,)  每步的 reward 序列
+            "dones": np.array(dones, dtype=bool),                               # (T,)  每步是否终止，这里全为 False
+            "entropies": np.array(entropies, dtype=np.float32),                 # (T,)  每步策略平均熵的时间序列
         }
 
         traj_queue.put(traj)

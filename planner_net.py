@@ -35,7 +35,7 @@ class PlannerNet(nn.Module):
         # 对局部博弈问题，卷积网络能捕获邻域交互关系（例如格点四邻居）
         self.body = nn.Sequential(
             # 大感受野的第一层（kernel_size=5）+ padding 保持尺寸
-            nn.Conv2d(in_channels, base_channels, kernel_size=5, padding=2),
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             # 两层 3x3 提取更深层的语义特征
             nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
@@ -63,12 +63,12 @@ class PlannerNet(nn.Module):
         前向计算：
         输入 x: (B, 3, L, L)
         返回 (alpha, value)
-          - alpha: (B, 5, L, L), 所有元素 > 0，可作为 Dirichlet 的浓度参数
+          - alpha: (B, 3, L, L), 所有元素 > 0，可作为 Dirichlet 的浓度参数
           - value: (B,)         状态值
         """
         feat = self.body(x)                          # (B, base, L, L)
-        raw_alpha = self.policy_head(feat)           # (B,5,L,L), 实数
+        raw_alpha = self.policy_head(feat)           # (B,3,L,L), 实数
         # softplus 将实数映射到正数，适合做浓度参数；加小常数避免靠近 0
-        alpha = F.softplus(raw_alpha) + 1e-3         # (B,5,L,L)
+        alpha = F.softplus(raw_alpha) + 1e-3         # (B,3,L,L)
         value = self.value_head(feat).squeeze(-1)    # (B,)
         return alpha, value
