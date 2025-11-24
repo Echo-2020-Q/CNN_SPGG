@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 
 class PlannerNet(nn.Module):
-    def __init__(self, in_channels=3, base_channels=32):
+    def __init__(self, in_channels=3, base_channels=64):
         super().__init__()
 
         # 主干卷积网络：提取局部与全局特征

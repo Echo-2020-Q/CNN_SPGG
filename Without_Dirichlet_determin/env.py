@@ -16,6 +16,9 @@ class PublicGoodsEnv:
     - 对每个格点 (i,j) 输出一个 5 维向量 π_ij（mid, up, down, left, right）；
     - 这个向量控制以 (i,j) 为中心那一组公共池如何在 5 个个体之间分配；
     - 通过学习 π_field，planner 试图引导系统形成高合作率 / 高总体收益的制度。
+
+    本环境版本与 Dirichlet 随机策略版接口保持兼容，
+    以便在 TD3 / 确定性 Actor 框架下直接复用。
     """
     def __init__(self, L=32, r=1.4, R_decay=0.10, use_cumulative_planner_reward=True, episode_length=500):
         """
@@ -27,7 +30,9 @@ class PublicGoodsEnv:
                                            若为 False，则返回每回合的平均净收益（不累加）。
         """
         self.L = L
-        self.r = r
+        # r 可能是 numpy/tensor，这里统一转成 Python float 方便后续做标量运算
+        # 使用 np.asarray(r).item() 可避免 "only one element tensors" 报错
+        self.r = float(np.asarray(r).item())
 
         # 当前策略：0=D, 1=C
         self.strategy = np.random.randint(0, 2, size=(L, L), dtype=np.int8)
@@ -57,6 +62,7 @@ class PublicGoodsEnv:
         self.idxs = np.arange(L)
 
         # Episode 相关：最大的演化步数 T_max（episode_length），以及当前步计数 t
+        # 每次 reset() 会把 self.t 归零，step() 中自增直到达到 episode_length 即 done=True。
         self.episode_length = int(episode_length)
         self.t = 0
     
@@ -74,8 +80,9 @@ class PublicGoodsEnv:
         stra_now = (self.strategy == 1).astype(np.float32)
         stra_prev = (self.prev_strategy == 1).astype(np.float32)
 
-        # 当前公共池（以各点为中心的小组的P）
-        P_map = self.P_center.astype(np.float32)
+        # 当前公共池（以各点为中心的小组的P），按理论最大值 5*r 做归一化: P_norm = P / (5*r)
+        # 这样当某个小组 5 个成员全为合作者时，该位置的 P_norm 接近 1，其余情况在 [0,1) 之间。
+        P_map = self.P_center.astype(np.float32) / (5.0 * float(self.r) + 1e-8)
 
         state = np.stack([stra_now, stra_prev, P_map], axis=0)
         return state
@@ -187,14 +194,19 @@ class PublicGoodsEnv:
         net_total = total_P - 5.0 * float(total_cooperators)
         avg_net = net_total / float(L * L)
 
-        # 根据开关决定是否累加 planner reward
+        # 进一步按理论最大值 5*(r-1) 做归一化，得到 per-step 归一化奖励
+        # 理解为：当前平均净收益 / 理论上每个体最多能获得的净收益（大致量级）
+        scale = 5.0 * max(self.r - 1.0, 1e-8)
+        norm_avg_net = avg_net / scale
+
+        # 根据开关决定是否累加 planner reward（在 TD3 设置中通常关闭累加）
         if self.use_cumulative_planner_reward:
-            # 把每回合的平均净收益累加到累计奖励
-            self.planner_cum_reward += avg_net
+            # 把“归一化后的平均净收益”累加到累计奖励
+            self.planner_cum_reward += norm_avg_net
             planner_reward = float(self.planner_cum_reward)
         else:
-            # 只返回本回合的平均净收益（不累加）
-            planner_reward = float(avg_net)
+            # 只返回本回合的归一化平均净收益（不累加）
+            planner_reward = float(norm_avg_net)
 
         # 同时保留 avg_R_new 供 info 使用
         avg_R_new = float(self.R.mean())
