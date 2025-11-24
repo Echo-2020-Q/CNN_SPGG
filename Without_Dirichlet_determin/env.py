@@ -199,7 +199,7 @@ class PublicGoodsEnv:
         scale = 5.0 * max(self.r - 1.0, 1e-8)
         norm_avg_net = avg_net / scale
 
-        # 根据开关决定是否累加 planner reward（在 TD3 设置中通常关闭累加）
+        # 根据开关决定是否累加 planner reward（在 TD3 设置中通常关闭累加）但是这是是默认开启累加的
         if self.use_cumulative_planner_reward:
             # 把“归一化后的平均净收益”累加到累计奖励
             self.planner_cum_reward += norm_avg_net
