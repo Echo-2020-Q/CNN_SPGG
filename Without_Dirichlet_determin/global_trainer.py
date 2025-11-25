@@ -514,6 +514,23 @@ def evaluate_trained_actor(
     return mean_reward, mean_fC
 
 
+def _evaluate_combo_worker(args):
+    """
+    多进程 eval 的 worker 包装：
+    接收一组参数，调用 evaluate_trained_actor 并返回带 L/r/episode_length 的结果。
+    """
+    actor_path, L_eval, r_eval, ep_len, eval_episodes, device = args
+    mean_reward, mean_fC = evaluate_trained_actor(
+        actor_path=actor_path,
+        L=L_eval,
+        r=r_eval,
+        episode_length=ep_len,
+        eval_episodes=eval_episodes,
+        device=device,
+    )
+    return L_eval, r_eval, ep_len, eval_episodes, mean_reward, mean_fC
+
+
 if __name__ == "__main__":
     # 示例配置：把所有重要超参集中在 TD3Config 中，便于一处调参
     cfg = TD3Config(
@@ -540,33 +557,47 @@ if __name__ == "__main__":
 
     # 若需要仅评估已有模型，可在这里配置
     EVAL_ONLY = True           #是否只是加载模型并且评估，不训练
+    EVAL_USE_MULTIPROCESS = True      # 是否使用多进程在多个 CPU 上并行评估
+    EVAL_NUM_WORKERS = 36           # 并行进程数；None 表示使用 mp.cpu_count()
     EVAL_RUN_ID = "20251119_230050第一版T3D较好效果"          # 需要评估的 run_id，例如 "20241120_153045"
     EVAL_L_LIST = [25, 30, 35, 40]                     # 可在列表中放多个 L
     EVAL_R_LIST = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5]  # 可在列表中放多个 r
-    EVAL_EPISODE_LENGTH_LIST = [150]                   # 可在列表中放多个 episode_length
+    EVAL_EPISODE_LENGTH_LIST = [150,50000]                   # 可在列表中放多个 episode_length
     EVAL_EPISODES = 10                                 # 每个组合评估的 episode 数
 
     if EVAL_ONLY:
+        import multiprocessing as mp
+
         if not EVAL_RUN_ID:
             raise ValueError("EVAL_ONLY=True 时必须设置 EVAL_RUN_ID")
         actor_path = os.path.join(cfg.save_dir, EVAL_RUN_ID, "actor.pt")
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         eval_csv = os.path.join(cfg.save_dir, f"eval_results_{EVAL_RUN_ID}_{timestamp}.csv")
+
+        combos = [
+            (actor_path, L_eval, r_eval, ep_len, EVAL_EPISODES, cfg.device)
+            for L_eval in EVAL_L_LIST
+            for r_eval in EVAL_R_LIST
+            for ep_len in EVAL_EPISODE_LENGTH_LIST
+        ]
+
+        if EVAL_USE_MULTIPROCESS:
+            num_workers = EVAL_NUM_WORKERS or mp.cpu_count()
+            print(f"[Eval] 使用多进程并行评估，进程数={num_workers}，组合数={len(combos)}")
+            with mp.Pool(processes=num_workers) as pool:
+                results = pool.map(_evaluate_combo_worker, combos)
+        else:
+            print(f"[Eval] 使用单进程顺序评估，组合数={len(combos)}")
+            results = []
+            for args in combos:
+                results.append(_evaluate_combo_worker(args))
+
         with open(eval_csv, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["L", "r", "episode_length", "eval_episodes", "mean_reward", "mean_fC"])
-            for L_eval in EVAL_L_LIST:
-                for r_eval in EVAL_R_LIST:
-                    for ep_len in EVAL_EPISODE_LENGTH_LIST:
-                        mean_reward, mean_fC = evaluate_trained_actor(
-                            actor_path=actor_path,
-                            L=L_eval,
-                            r=r_eval,
-                            episode_length=ep_len,
-                            eval_episodes=EVAL_EPISODES,
-                            device=cfg.device,
-                        )
-                        writer.writerow([L_eval, r_eval, ep_len, EVAL_EPISODES, mean_reward, mean_fC])
+            for L_eval, r_eval, ep_len, eval_episodes, mean_reward, mean_fC in results:
+                writer.writerow([L_eval, r_eval, ep_len, eval_episodes, mean_reward, mean_fC])
+
         print(f"[Eval] 保存所有组合结果到 {eval_csv}")
     else:
         train_td3(

@@ -19,8 +19,18 @@ class PublicGoodsEnv:
 
     本环境版本与 Dirichlet 随机策略版接口保持兼容，
     以便在 TD3 / 确定性 Actor 框架下直接复用。
+    额外机制：个体有“累计资源”，若资源不足合作成本则无法合作（即便策略位为 1 也视为 D）。
     """
-    def __init__(self, L=32, r=1.4, R_decay=0.10, use_cumulative_planner_reward=True, episode_length=500):
+    def __init__(
+        self,
+        L=32,
+        r=1.4,
+        R_decay=0.10,
+        use_cumulative_planner_reward=True,
+        episode_length=500,
+        coop_cost=5.0,
+        initial_R=30,
+    ):
         """
         Args:
             L: 网格边长
@@ -28,11 +38,15 @@ class PublicGoodsEnv:
             R_decay: 每回合累计资源衰减比例（例如 0.10 表示每回合减少 10%）
             use_cumulative_planner_reward: 若为 True，则 planner 奖励按每回合平均净收益累加并返回累计值；
                                            若为 False，则返回每回合的平均净收益（不累加）。
+            coop_cost: 合作所需成本。若累计资源 R < coop_cost，则本轮无法合作（即使策略位为 1 也视为 D）。
+            initial_R: 初始累计资源，避免开局全部无法合作。
         """
         self.L = L
         # r 可能是 numpy/tensor，这里统一转成 Python float 方便后续做标量运算
         # 使用 np.asarray(r).item() 可避免 "only one element tensors" 报错
         self.r = float(np.asarray(r).item())
+        self.coop_cost = float(coop_cost)
+        self.initial_R = float(initial_R)
 
         # 当前策略：0=D, 1=C
         self.strategy = np.random.randint(0, 2, size=(L, L), dtype=np.int8)
@@ -41,7 +55,7 @@ class PublicGoodsEnv:
         self.prev_strategy = self.strategy.copy()
 
         # 累计资源
-        self.R = np.zeros((L, L), dtype=np.float32)
+        self.R = np.full((L, L), fill_value=self.initial_R, dtype=np.float32)
 
         # 当轮收益 r_i(t)
         self.r_t = np.zeros((L, L), dtype=np.float32)
@@ -76,8 +90,9 @@ class PublicGoodsEnv:
 
         输出 shape: (3, L, L)
         """
-        # 当前轮与上一轮的策略（单通道布尔 -> float32）
-        stra_now = (self.strategy == 1).astype(np.float32)
+        # 当前轮与上一轮的策略（单通道布尔 -> float32），资源不足 coop_cost 视为 D
+        can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
+        stra_now = can_cooperate.astype(np.float32)
         stra_prev = (self.prev_strategy == 1).astype(np.float32)
 
         # 当前公共池（以各点为中心的小组的P），按理论最大值 5*r 做归一化: P_norm = P / (5*r)
@@ -123,6 +138,8 @@ class PublicGoodsEnv:
                 if np.random.rand() < prob:
                     new_strategy[i, j] = self.strategy[xj, yj]
 
+        # 资源不足 coop_cost 的个体无法保持 / 切换到合作，强制视为 D
+        new_strategy[self.R < self.coop_cost] = 0
         self.strategy = new_strategy
     # ==============================================================
     def step(self, pi_field):
@@ -155,8 +172,8 @@ class PublicGoodsEnv:
                 mid   = (i, j)
                 group_coords = [mid, up, down, left, right]
 
-                # 合作者数量 n_c：统计该小组中策略为 C 的个体数
-                n_c = sum(self.strategy[x, y] == 1 for x, y in group_coords)
+                # 合作者数量 n_c：策略为 C 且资源充足的个体才算合作者
+                n_c = sum((self.strategy[x, y] == 1) and (self.R[x, y] >= self.coop_cost) for x, y in group_coords)
 
                 # 公共池 P = r * n_c
                 P = r * n_c
@@ -172,7 +189,8 @@ class PublicGoodsEnv:
                 # 结算本小组对每个成员的收益
                 for k, (x, y) in enumerate(group_coords):
                     income = pi_vec[k] * P
-                    if self.strategy[x, y] == 1:   # 合作者扣成本1
+                    # 只有资源充足且策略为 C 的个体才真正付出成本
+                    if (self.strategy[x, y] == 1) and (self.R[x, y] >= self.coop_cost):
                         income -= 1.0
                     new_r[x, y] += income
 
@@ -190,7 +208,7 @@ class PublicGoodsEnv:
         # 如果 use_cumulative_planner_reward=True，则对 avg_net 做时间累加，
         # 让 planner 在长期尺度上优化制度；否则就只看单步表现。
         total_P = float(self.P_center.sum())
-        total_cooperators = int((self.strategy == 1).sum())
+        total_cooperators = int(((self.strategy == 1) & (self.R >= self.coop_cost)).sum())
         net_total = total_P - 5.0 * float(total_cooperators)
         avg_net = net_total / float(L * L)
 
@@ -211,8 +229,8 @@ class PublicGoodsEnv:
         # 同时保留 avg_R_new 供 info 使用
         avg_R_new = float(self.R.mean())
         
-        # ====== 策略更新前，先保存当前策略为 prev_strategy ======
-        self.prev_strategy = self.strategy.copy()
+        # ====== 策略更新前，先保存“上一轮的可合作状态”作为 prev_strategy ======
+        self.prev_strategy = ((self.strategy == 1) & (self.R >= self.coop_cost)).astype(np.int8)
 
         # --------- 4. 更新个体策略：Fermi 复制规则 ----------
         self._update_strategy_fermi(beta=1.0)
@@ -225,7 +243,7 @@ class PublicGoodsEnv:
             "avg_R": avg_R_new,
             "avg_r": new_r.mean(),
             "avg_net": avg_net,           # 本回合的平均净收益（total_P - 5*#C）/L^2
-            "f_C":  self.strategy.mean(),  # 合作率
+            "f_C":  ((self.strategy == 1) & (self.R >= self.coop_cost)).mean(),  # 实际可合作率
             "t": self.t,
             "done": done,
         }
@@ -236,7 +254,7 @@ class PublicGoodsEnv:
         # 重置策略、资源、r_t、P_center、prev_strategy 等
         self.strategy = np.random.randint(0, 2, size=(self.L, self.L), dtype=np.int8)
         self.prev_strategy = self.strategy.copy()
-        self.R.fill(0.0)
+        self.R.fill(self.initial_R)
         self.r_t.fill(0.0)
         self.P_center.fill(0.0)
         # 重置 planner 累计奖励（如果有使用累计式奖励）
