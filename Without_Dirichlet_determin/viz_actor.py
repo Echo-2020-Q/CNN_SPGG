@@ -20,8 +20,10 @@ import os
 import datetime
 from typing import List, Tuple
 
-import matplotlib.pyplot as plt
 import matplotlib
+# 使用无界面后台，避免 Tk pixmap 相关错误
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -39,7 +41,7 @@ DEFAULT_CFG = {
     "L": 40,                  # 棋盘边长
     "r": 4.0,                 # 公共物品放大因子
     "episode_length": 150,    # rollout 时每个 episode 的最大步数
-    "num_states": 15,          # 需要可视化的状态数量
+    "num_states": 150,          # 需要可视化的状态数量
     "max_steps": 300,         # 最多滚动多少步来采集 num_states
     "device": "cuda",         # 运行设备，如 "cpu" 或 "cuda:0"
     "out_dir": "viz_outputs",  # 输出图片目录
@@ -49,10 +51,31 @@ DEFAULT_CFG = {
     # 敏感度目标：关注“哪个个体（格点）”的动作输出；当为 -1 时表示“不指定单点”
     "saliency_target_row": -1,  # 行索引，>=0 时才做单点敏感度
     "saliency_target_col": -1,  # 列索引，>=0 时才做单点敏感度
-    "grad_cam": True,          # 是否输出 Grad-CAM（空间注意力）
-    "grad_cam_all": True,      # 是否对棋盘所有格点做 Grad-CAM（会取平均聚合，避免输出过多图片）
-    "ig_channels": True,      # 是否输出通道贡献柱状图（Integrated Gradients）
+    "grad_cam": True,              # 是否输出 Grad-CAM（空间注意力）
+    "grad_cam_all": True,          # 是否对棋盘所有格点做 Grad-CAM（会取平均聚合，避免输出过多图片）
+    "ig_channels": True,           # 是否输出通道贡献柱状图（Integrated Gradients）
+    "ig_baseline": True,          # 是否用全 0 baseline 计算 IG
+    "ig_trajectory_baseline": True,  # 是否用轨迹起点 state(t_initial) 作为 baseline 计算 IG
+    "ig_t_initial": 0,             # IG 轨迹 baseline 的起点索引（在收集到的状态列表中的索引，默认0表示第一帧）
+    "ig_t_end": -1,                # IG 终点索引（-1 表示最后一帧）
+    "ig_steps_baseline": 50,       # 全0 baseline 模式下的插值步数
+    "ig_steps_traj": 50,           # 轨迹 baseline 模式下的插值步数
 }
+
+# 简单清洗热力/注意力图，避免 inf/NaN 导致 imshow 归一化溢出
+def _clean_heatmap(arr: np.ndarray) -> np.ndarray:
+    clean = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    finite = clean[np.isfinite(clean)]
+    if finite.size == 0:
+        return np.zeros_like(clean)
+    clip_val = np.percentile(np.abs(finite), 99.9)
+    if clip_val > 0:
+        clean = np.clip(clean, -clip_val, clip_val)
+    if clean.max() > clean.min():
+        clean = (clean - clean.min()) / (clean.max() - clean.min() + 1e-8)
+    else:
+        clean = np.zeros_like(clean)
+    return clean
 
 
 def load_actor(actor_path: str, device: str) -> ActorNet:
@@ -463,7 +486,8 @@ def plot_saliency(
     axes[2].set_title("P_center_norm")
     fig.colorbar(im1, ax=axes[2], fraction=0.046, pad=0.04)
 
-    im2 = axes[3].imshow(saliency, cmap="magma", vmin=0.0, vmax=1.0)
+    saliency_clean = _clean_heatmap(saliency)
+    im2 = axes[3].imshow(saliency_clean, cmap="magma", vmin=0.0, vmax=1.0)
     axes[3].set_title("Saliency (敏感度)")
     fig.colorbar(im2, ax=axes[3], fraction=0.046, pad=0.04)
 
@@ -504,7 +528,8 @@ def plot_saliency_channels(
     axes[0, 0].set_title("Stra_prev (上一轮策略)")
     fig.colorbar(im_prev, ax=axes[0, 0], fraction=0.046, pad=0.04)
 
-    im_prev_sal = axes[1, 0].imshow(saliency_ch[0], cmap="magma", vmin=0.0, vmax=1.0)
+    sal_prev_clean = _clean_heatmap(saliency_ch[0])
+    im_prev_sal = axes[1, 0].imshow(sal_prev_clean, cmap="magma", vmin=0.0, vmax=1.0)
     axes[1, 0].set_title("Saliency: 通道1 (上一轮)")
     fig.colorbar(im_prev_sal, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
@@ -513,7 +538,8 @@ def plot_saliency_channels(
     axes[0, 1].set_title("Stra_now (本轮可合作)")
     fig.colorbar(im_now, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
-    im_now_sal = axes[1, 1].imshow(saliency_ch[1], cmap="magma", vmin=0.0, vmax=1.0)
+    sal_now_clean = _clean_heatmap(saliency_ch[1])
+    im_now_sal = axes[1, 1].imshow(sal_now_clean, cmap="magma", vmin=0.0, vmax=1.0)
     axes[1, 1].set_title("Saliency: 通道2 (本轮)")
     fig.colorbar(im_now_sal, ax=axes[1, 1], fraction=0.046, pad=0.04)
 
@@ -522,7 +548,8 @@ def plot_saliency_channels(
     axes[0, 2].set_title("P_center_norm")
     fig.colorbar(im_p, ax=axes[0, 2], fraction=0.046, pad=0.04)
 
-    im_p_sal = axes[1, 2].imshow(saliency_ch[2], cmap="magma", vmin=0.0, vmax=1.0)
+    sal_p_clean = _clean_heatmap(saliency_ch[2])
+    im_p_sal = axes[1, 2].imshow(sal_p_clean, cmap="magma", vmin=0.0, vmax=1.0)
     axes[1, 2].set_title("Saliency: 通道3 (资源)")
     fig.colorbar(im_p_sal, ax=axes[1, 2], fraction=0.046, pad=0.04)
 
@@ -537,16 +564,16 @@ def plot_saliency_channels(
 
 def compute_ig_channels(
     actor: ActorNet,
-    state: np.ndarray,
+    baseline_state: np.ndarray,
+    target_state: np.ndarray,
     device: str,
-    target_row: int,
-    target_col: int,
     m_steps: int = 20,
 ) -> np.ndarray:
     """
-    通道级 Integrated Gradients：
+    通道级 Integrated Gradients（全局版）：
     - baseline 取全 0；
     - 从 baseline 到 state 做 m_steps 次线性插值；
+    - 每一步以全局动作输出 pi.mean() 为目标标量；
     - 累积梯度近似积分，得到每个通道的 IG；
     - 在空间上求和，得到 3 个通道的整体贡献，并做绝对值归一化到和为 1。
 
@@ -555,20 +582,11 @@ def compute_ig_channels(
     """
     actor.eval()
 
-    state_np = state.astype(np.float32)
-    baseline_np = np.zeros_like(state_np, dtype=np.float32)
+    state_np = target_state.astype(np.float32)
+    baseline_np = baseline_state.astype(np.float32)
 
     state_t = torch.from_numpy(state_np).unsqueeze(0).to(device)    # (1,3,L,L)
     baseline_t = torch.from_numpy(baseline_np).unsqueeze(0).to(device)
-
-    # 选择目标格点；若未指定则取中心
-    with torch.no_grad():
-        pi_ref = actor(state_t)
-    _, _, H, W = pi_ref.shape
-    row = target_row if target_row >= 0 else H // 2
-    col = target_col if target_col >= 0 else W // 2
-    row = max(0, min(row, H - 1))
-    col = max(0, min(col, W - 1))
 
     total_grad = torch.zeros_like(state_t)
 
@@ -577,7 +595,7 @@ def compute_ig_channels(
         x = baseline_t + alpha * (state_t - baseline_t)
         x.requires_grad_(True)
         pi = actor(x)  # (1,5,L,L)
-        target = pi[:, :, row, col].mean()
+        target = pi.mean()  # 全局动作输出的平均值
 
         actor.zero_grad()
         if x.grad is not None:
@@ -657,7 +675,8 @@ def plot_grad_cam(
     axes[2].set_title("P_center_norm")
     fig.colorbar(im1, ax=axes[2], fraction=0.046, pad=0.04)
 
-    im2 = axes[3].imshow(cam, cmap="magma", vmin=0.0, vmax=1.0)
+    cam_clean = _clean_heatmap(cam)
+    im2 = axes[3].imshow(cam_clean, cmap="magma", vmin=0.0, vmax=1.0)
     axes[3].set_title("Grad-CAM (空间注意力)")
     fig.colorbar(im2, ax=axes[3], fraction=0.046, pad=0.04)
 
@@ -717,6 +736,42 @@ def main():
         action="store_true",
         default=DEFAULT_CFG["ig_channels"],
         help="是否输出通道贡献柱状图（Integrated Gradients）",
+    )
+    parser.add_argument(
+        "--ig-baseline",
+        action="store_true",
+        default=DEFAULT_CFG["ig_baseline"],
+        help="是否使用全 0 baseline 计算 IG 通道贡献",
+    )
+    parser.add_argument(
+        "--ig-trajectory-baseline",
+        action="store_true",
+        default=DEFAULT_CFG["ig_trajectory_baseline"],
+        help="是否使用轨迹起点 state(t_initial) 作为 baseline 计算 IG 通道贡献",
+    )
+    parser.add_argument(
+        "--ig-t-initial",
+        type=int,
+        default=DEFAULT_CFG["ig_t_initial"],
+        help="IG 轨迹 baseline 起点在收集状态列表中的索引（0 表示第一帧，-1 无效）",
+    )
+    parser.add_argument(
+        "--ig-t-end",
+        type=int,
+        default=DEFAULT_CFG["ig_t_end"],
+        help="IG 终点在收集状态列表中的索引（-1 表示最后一帧）",
+    )
+    parser.add_argument(
+        "--ig-steps-baseline",
+        type=int,
+        default=DEFAULT_CFG["ig_steps_baseline"],
+        help="全 0 baseline 模式下 IG 的插值步数",
+    )
+    parser.add_argument(
+        "--ig-steps-traj",
+        type=int,
+        default=DEFAULT_CFG["ig_steps_traj"],
+        help="轨迹 baseline 模式下 IG 的插值步数",
     )
     args = parser.parse_args()
 
@@ -836,31 +891,7 @@ def main():
             )
             print(f"[viz] saved {sal_ch_path}")
 
-        # 4) 通道贡献柱状图（Integrated Gradients）
-        if args.ig_channels:
-            ig_contrib = compute_ig_channels(
-                actor=actor,
-                state=state,
-                device=args.device,
-                target_row=args.saliency_target_row,
-                target_col=args.saliency_target_col,
-            )
-            ig_path = os.path.join(
-                save_dir,
-                f"viz_ig_channels_{timestamp}_{idx}_r{args.saliency_target_row}_c{args.saliency_target_col}.png",
-            )
-            ig_title = "Integrated Gradients 通道贡献"
-            plot_ig_bar(
-                ig_contrib,
-                ig_path,
-                ig_title,
-                L=args.L,
-                r=args.r,
-                t=info.get("t", 0),
-            )
-            print(f"[viz] saved {ig_path}")
-
-        # 可选：生成 Grad-CAM，展示空间注意力
+        # 4) Grad-CAM：为每个采样状态都输出一张
         if args.grad_cam:
             if args.grad_cam_all:
                 cam = compute_grad_cam_all(
@@ -885,6 +916,75 @@ def main():
                 cam_path = os.path.join(save_dir, f"viz_gradcam_{timestamp}_{idx}_{cam_suffix}.png")
                 plot_grad_cam(state, cam, cam_path, cam_title, L=args.L, r=args.r, t=info.get("t", 0))
                 print(f"[viz] saved {cam_path}")
+
+    # 5) 通道贡献柱状图（Integrated Gradients），基于可调的 t_initial / t_end
+    if args.ig_channels and collected:
+        n = len(collected)
+        # 终点索引：默认 -1 表示最后一帧
+        if args.ig_t_end < 0:
+            end_idx = n - 1
+        else:
+            end_idx = max(0, min(args.ig_t_end, n - 1))
+
+        # 起点索引：默认 0 表示第一帧
+        if args.ig_t_initial < 0:
+            init_idx = 0
+        else:
+            init_idx = max(0, min(args.ig_t_initial, n - 1))
+
+        target_state, _, target_info = collected[end_idx]
+
+        # baseline 1: 全 0
+        if args.ig_baseline:
+            baseline_zero = np.zeros_like(target_state, dtype=np.float32)
+            ig_contrib_zero = compute_ig_channels(
+                actor=actor,
+                baseline_state=baseline_zero,
+                target_state=target_state,
+                device=args.device,
+                m_steps=args.ig_steps_baseline,
+            )
+            ig_path_zero = os.path.join(
+                save_dir,
+                f"viz_ig_channels_baseline_{timestamp}_init0_end{end_idx}.png",
+            )
+            ig_title_zero = "IG 通道贡献 (baseline=全0)"
+            plot_ig_bar(
+                ig_contrib_zero,
+                ig_path_zero,
+                ig_title_zero,
+                L=args.L,
+                r=args.r,
+                t=target_info.get("t", 0),
+            )
+            print(f"[viz] saved {ig_path_zero}")
+
+        # baseline 2: 轨迹起点 t_initial（同一条 rollout 的第 init_idx 个状态）
+        if args.ig_trajectory_baseline and n > 1:
+            baseline_state, _, baseline_info = collected[init_idx]
+            ig_contrib_traj = compute_ig_channels(
+                actor=actor,
+                baseline_state=baseline_state,
+                target_state=target_state,
+                device=args.device,
+                m_steps=args.ig_steps_traj,
+            )
+            ig_path_traj = os.path.join(
+                save_dir,
+                f"viz_ig_channels_traj_{timestamp}_init{init_idx}_end{end_idx}.png",
+            )
+            ig_title_traj = (
+                f"IG 通道贡献 (baseline=t_initial, t0={baseline_info.get('t', 0)})"
+            )
+            plot_ig_bar(
+                ig_contrib_traj,
+                ig_path_traj,
+                ig_title_traj,
+                L=args.L,
+                r=args.r,
+                t=target_info.get("t", 0),
+            )
+            print(f"[viz] saved {ig_path_traj}")
 
     if not collected:
         print("[viz] no states collected, consider increasing max-steps.")
