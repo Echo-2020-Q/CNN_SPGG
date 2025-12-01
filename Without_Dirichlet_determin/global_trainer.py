@@ -52,7 +52,7 @@ class TD3Config:
     tau: float = 0.005           # target 网络软更新系数
     policy_noise: float = 0.1    # target smoothing 噪声强度（加在 target actor logits 上）
     noise_clip: float = 0.2      # target smoothing 噪声截断范围
-    expl_noise: float = 0.1      # 行为策略探索噪声（加在行为 logits 上）
+    expl_noise: float = 0      # 行为策略探索噪声（加在行为 logits 上）；这个值应该很小0.01
     policy_delay: int = 2        # 每多少次 critic 更新，更新一次 actor
     batch_size: int = 32         # 每次更新时从 replay buffer 采样的 batch 大小
     replay_size: int = 100_000   # replay buffer 容量
@@ -65,6 +65,7 @@ class TD3Config:
     load_run_id: str | None = None  # 若不为 None，则尝试从该 run_id 加载已有模型
     save_best: bool = True       # eval 表现更好时是否保存 best_*.pt
     early_stop_patience: int = 0 # 若 >0，则 eval reward 连续若干次未提升时提前停止
+    min_steps_for_early_stop: int = 0  # 早停生效的最小 step，默认 0 表示从一开始就生效
 
 
 class ReplayBuffer:
@@ -137,14 +138,24 @@ def train_td3(
     r: float = 1.4,
     episode_length: int = 500,
     cfg: TD3Config | None = None,
+    initial_R: float | None = None,
 ):
     if cfg is None:
         cfg = TD3Config()
 
     device = cfg.device
 
-    # 这里关闭累计式 planner 奖励，直接使用每一步平均净收益作为 reward
-    env = PublicGoodsEnv(L=L, r=r, episode_length=episode_length, use_cumulative_planner_reward=False)
+    # 这里开启累计式 planner 奖励，直接使用每一步平均净收益作为 reward
+    env_kwargs = dict(
+        L=L,
+        r=r,
+        episode_length=episode_length,
+        use_cumulative_planner_reward=True,
+    )
+    # 如指定 initial_R，则覆盖环境默认初始资源
+    if initial_R is not None:
+        env_kwargs["initial_R"] = initial_R
+    env = PublicGoodsEnv(**env_kwargs)
 
     # 主网络：Actor 和两个 Critic
     actor = ActorNet().to(device)
@@ -371,8 +382,15 @@ def train_td3(
                     print(f"[Eval] Saved new best models at step={step} (reward={mean_er:.4f})")
             else:
                 since_best += 1
-                if cfg.early_stop_patience > 0 and since_best >= cfg.early_stop_patience:
-                    print(f"[Eval] Early stopping triggered at step={step} (no improvement for {since_best} evals)")
+                if (
+                    cfg.early_stop_patience > 0
+                    and step >= cfg.min_steps_for_early_stop
+                    and since_best >= cfg.early_stop_patience
+                ):
+                    print(
+                        f"[Eval] Early stopping triggered at step={step} "
+                        f"(no improvement for {since_best} evals, min_steps={cfg.min_steps_for_early_stop})"
+                    )
                     stop_training = True
             if log_writer is not None:
                 log_writer.writerow([
@@ -533,30 +551,55 @@ def _evaluate_combo_worker(args):
 
 if __name__ == "__main__":
     # 示例配置：把所有重要超参集中在 TD3Config 中，便于一处调参
-    cfg = TD3Config(
+    cfg1 = TD3Config(
         device="cuda:0",             # 训练设备（"cpu" / "cuda:0" 等）
         gamma=0.99,                  # 折扣因子
         actor_lr=1e-4,               # Actor 学习率
         critic_lr=1e-4,              # Critic 学习率
         tau=0.005,                   # target 网络软更新系数
-        policy_noise=0.10,           # target smoothing 噪声强度
-        noise_clip=0.20,             # target smoothing 噪声截断范围
-        expl_noise=0.0,              # 行为策略探索噪声
+        policy_noise=0.03,           # target smoothing 噪声强度
+        noise_clip=0.05,             # target smoothing 噪声截断范围
+        expl_noise=0.00,             # 行为策略探索噪声
         policy_delay=2,              # policy 延迟更新频率
         batch_size=32,               # 每次更新采样的 batch 大小
-        replay_size=100_000,         # 经验回放容量
-        total_steps=400_000,         # 总交互步数
-        start_steps=20_000,          # 纯探索步数
-        eval_interval=5_000,         # 评估间隔（<=0 表示不评估）
+        replay_size=500_000,         # 经验回放容量
+        total_steps=1500_000,         # 总交互步数
+        start_steps=10_000,          # 纯探索步数
+        eval_interval=6_000,         # 评估间隔（<=0 表示不评估）
+        eval_episodes = 5,           # 评估次数略增，平滑曲线
         save_models=True,            # 是否保存 checkpoint
         save_dir=os.path.join(os.path.dirname(__file__), "checkpoints"),  # checkpoint 保存目录（绝对路径）
         load_run_id=None,            # 若要从已有 run 续训，在此填入 run_id
         save_best=True,              # eval 表现更好时是否保存 best_*.pt
-        early_stop_patience=0,       # 若 >0，则 eval reward 连续若干次未提升时提前停止
+        early_stop_patience=10,       # 若 >0，则 eval reward 连续若干次未提升时提前停止
+        min_steps_for_early_stop=600_000  # 提前停止前的最小训练步数
     )
-
+        #继续训练 配置
+    cfg2 = TD3Config(
+        device="cuda:1",             # 训练设备（"cpu" / "cuda:0" 等）
+        gamma=0.99,                  # 折扣因子
+        actor_lr=1e-4,               # Actor 学习率
+        critic_lr=1e-4,              # Critic 学习率
+        tau=0.005,                   # target 网络软更新系数
+        policy_noise=0.03,           # target smoothing 噪声强度
+        noise_clip=0.05,             # target smoothing 噪声截断范围
+        expl_noise=0.001,             # 行为策略探索噪声
+        policy_delay=2,              # policy 延迟更新频率
+        batch_size=32,               # 每次更新采样的 batch 大小
+        replay_size=500_000,         # 经验回放容量
+        total_steps=1500_000,         # 总交互步数
+        start_steps=0,            # 纯探索步数 如果加载模型的话就调低一点啊啊啊   10_000
+        eval_interval=6_000,         # 评估间隔（<=0 表示不评估）
+        eval_episodes = 5,           # 评估次数略增，平滑曲线
+        save_models=True,            # 是否保存 checkpoint
+        save_dir=os.path.join(os.path.dirname(__file__), "checkpoints"),  # checkpoint 保存目录（绝对路径）
+        load_run_id=None,            # 若要从已有 run 续训，在此填入 run_id
+        save_best=True,              # eval 表现更好时是否保存 best_*.pt
+        early_stop_patience=15,       # 若 >0，则 eval reward 连续若干次未提升时提前停止
+        min_steps_for_early_stop=600_000,  # 早停生效的最小 step，避免一开始就早停
+    )
     # 若需要仅评估已有模型，可在这里配置
-    EVAL_ONLY = True           #是否只是加载模型并且评估，不训练
+    EVAL_ONLY = False           #是否只是加载模型并且评估，不训练
     EVAL_USE_MULTIPROCESS = True      # 是否使用多进程在多个 CPU 上并行评估
     EVAL_NUM_WORKERS = 36           # 并行进程数；None 表示使用 mp.cpu_count()
     EVAL_RUN_ID = "20251119_230050第一版T3D较好效果"          # 需要评估的 run_id，例如 "20241120_153045"
@@ -570,12 +613,12 @@ if __name__ == "__main__":
 
         if not EVAL_RUN_ID:
             raise ValueError("EVAL_ONLY=True 时必须设置 EVAL_RUN_ID")
-        actor_path = os.path.join(cfg.save_dir, EVAL_RUN_ID, "actor.pt")
+        actor_path = os.path.join(cfg1.save_dir, EVAL_RUN_ID, "actor.pt")
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        eval_csv = os.path.join(cfg.save_dir, f"eval_results_{EVAL_RUN_ID}_{timestamp}.csv")
+        eval_csv = os.path.join(cfg1.save_dir, f"eval_results_{EVAL_RUN_ID}_{timestamp}.csv")
 
         combos = [
-            (actor_path, L_eval, r_eval, ep_len, EVAL_EPISODES, cfg.device)
+            (actor_path, L_eval, r_eval, ep_len, EVAL_EPISODES, cfg1.device)
             for L_eval in EVAL_L_LIST
             for r_eval in EVAL_R_LIST
             for ep_len in EVAL_EPISODE_LENGTH_LIST
@@ -604,5 +647,6 @@ if __name__ == "__main__":
             L=25,                        # 棋盘边长
             r=4.0,                       # 公共物品放大因子
             episode_length=150,          # 每个 episode 的最大步数
-            cfg=cfg,
+            cfg=cfg2,
+            initial_R=50,                 # 初始资源
         )

@@ -130,9 +130,12 @@ class PublicGoodsEnv:
                 ri = self.r_t[i, j]
                 rj = self.r_t[xj, yj]
 
-                # 2. 费米函数给出模仿概率
+                # 2. 费米函数给出模仿概率（加入截断避免 exp 溢出）
                 diff = rj - ri
-                prob = 1.0 / (1.0 + np.exp(-beta * diff))
+                x = -beta * diff
+                # 避免 |x| 过大导致 np.exp 溢出，数值上相当于把极端概率截到接近 0/1
+                x = np.clip(x, -60.0, 60.0)
+                prob = 1.0 / (1.0 + np.exp(x))
 
                 # 3. 以 prob 概率采样是否模仿邻居 j
                 if np.random.rand() < prob:

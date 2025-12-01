@@ -57,7 +57,7 @@ DEFAULT_CFG = {
     "ig_baseline": True,          # 是否用全 0 baseline 计算 IG
     "ig_trajectory_baseline": True,  # 是否用轨迹起点 state(t_initial) 作为 baseline 计算 IG
     "ig_t_initial": 0,             # IG 轨迹 baseline 的起点索引（在收集到的状态列表中的索引，默认0表示第一帧）
-    "ig_t_end": -1,                # IG 终点索引（-1 表示最后一帧）
+    "ig_t_end": 149,                # IG 终点索引（-1 表示最后一帧）
     "ig_steps_baseline": 50,       # 全0 baseline 模式下的插值步数
     "ig_steps_traj": 50,           # 轨迹 baseline 模式下的插值步数
 }
