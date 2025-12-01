@@ -27,6 +27,7 @@ import csv
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import MultiplicativeLR
 
 try:
     import matplotlib.pyplot as plt
@@ -66,6 +67,8 @@ class TD3Config:
     save_best: bool = True       # eval 表现更好时是否保存 best_*.pt
     early_stop_patience: int = 0 # 若 >0，则 eval reward 连续若干次未提升时提前停止
     min_steps_for_early_stop: int = 0  # 早停生效的最小 step，默认 0 表示从一开始就生效
+    lr_decay_fC_threshold: float = 0.7  # eval 合作率达到该阈值时触发 lr 衰减
+    lr_decay_multiplier: float = 0.5    # lr 衰减乘子（乘在当前 lr 上）
 
 
 class ReplayBuffer:
@@ -172,6 +175,9 @@ def train_td3(
     # 优化器：一个 Actor，一个共享 Critic 优化器（同时更新 Q1/Q2）
     actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.actor_lr)
     critic_opt = torch.optim.Adam(list(critic1.parameters()) + list(critic2.parameters()), lr=cfg.critic_lr)
+    # 学习率调度器：当 eval 合作率达到阈值时手动降低 lr（乘以 0.5）
+    actor_sched = MultiplicativeLR(actor_opt, lr_lambda=lambda _: cfg.lr_decay_multiplier)
+    critic_sched = MultiplicativeLR(critic_opt, lr_lambda=lambda _: cfg.lr_decay_multiplier)
 
     # 运行 ID（用于保存模型与图像），时间戳形式
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -205,6 +211,7 @@ def train_td3(
     best_eval_reward = -float("inf")
     since_best = 0
     stop_training = False
+    lr_lowered = False  # 只在 eval 合作率高于阈值时降低一次 lr
 
     # 打开训练日志（CSV）
     log_file = None
@@ -368,6 +375,16 @@ def train_td3(
             print(
                 f"[Eval] step={step}, eval_reward={mean_er:.4f}, eval_mean_fC={mean_ef:.4f}"
             )
+            # 若合作率达到阈值且尚未降低过 lr，则将 actor/critic lr 乘以 0.5
+            if (not lr_lowered) and (mean_ef > cfg.lr_decay_fC_threshold):
+                actor_sched.step()
+                critic_sched.step()
+                lr_lowered = True
+                print(
+                    f"[LR] eval_mean_fC={mean_ef:.4f} > {cfg.lr_decay_fC_threshold}, 降低学习率，"
+                    f"actor_lr={actor_opt.param_groups[0]['lr']:.6g}, "
+                    f"critic_lr={critic_opt.param_groups[0]['lr']:.6g}"
+                )
             # 如表现提升，则记录为 best 并可额外保存
             if mean_er > best_eval_reward + 1e-8:
                 best_eval_reward = mean_er
@@ -572,9 +589,11 @@ if __name__ == "__main__":
         load_run_id=None,            # 若要从已有 run 续训，在此填入 run_id
         save_best=True,              # eval 表现更好时是否保存 best_*.pt
         early_stop_patience=10,       # 若 >0，则 eval reward 连续若干次未提升时提前停止
-        min_steps_for_early_stop=600_000  # 提前停止前的最小训练步数
+        min_steps_for_early_stop=600_000,  # 提前停止前的最小训练步数
+        lr_decay_fC_threshold= 0.7,  # eval 合作率达到该阈值时触发 lr 衰减
+        lr_decay_multiplier=0.5    # lr 衰减乘子（乘在当前 lr 上）
     )
-        #继续训练 配置
+#继续训练 配置
     cfg2 = TD3Config(
         device="cuda:1",             # 训练设备（"cpu" / "cuda:0" 等）
         gamma=0.99,                  # 折扣因子
@@ -583,7 +602,7 @@ if __name__ == "__main__":
         tau=0.005,                   # target 网络软更新系数
         policy_noise=0.03,           # target smoothing 噪声强度
         noise_clip=0.05,             # target smoothing 噪声截断范围
-        expl_noise=0.001,             # 行为策略探索噪声
+        expl_noise=0.005,             # 行为策略探索噪声
         policy_delay=2,              # policy 延迟更新频率
         batch_size=256,               # 每次更新采样的 batch 大小
         replay_size=500_000,         # 经验回放容量
@@ -597,6 +616,8 @@ if __name__ == "__main__":
         save_best=True,              # eval 表现更好时是否保存 best_*.pt
         early_stop_patience=15,       # 若 >0，则 eval reward 连续若干次未提升时提前停止
         min_steps_for_early_stop=600_000,  # 早停生效的最小 step，避免一开始就早停
+        lr_decay_fC_threshold= 0.65,  # eval 合作率达到该阈值时触发 lr 衰减
+        lr_decay_multiplier=0.25    # lr 衰减乘子（乘在当前 lr 上）
     )
     # 若需要仅评估已有模型，可在这里配置
     EVAL_ONLY = False           #是否只是加载模型并且评估，不训练
