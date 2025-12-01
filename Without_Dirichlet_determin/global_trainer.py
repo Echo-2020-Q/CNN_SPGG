@@ -153,7 +153,7 @@ def train_td3(
         L=L,
         r=r,
         episode_length=episode_length,
-        use_cumulative_planner_reward=True,
+        use_cumulative_planner_reward=False,
     )
     # 如指定 initial_R，则覆盖环境默认初始资源
     if initial_R is not None:
@@ -591,7 +591,7 @@ if __name__ == "__main__":
         early_stop_patience=10,       # 若 >0，则 eval reward 连续若干次未提升时提前停止
         min_steps_for_early_stop=600_000,  # 提前停止前的最小训练步数
         lr_decay_fC_threshold= 0.7,  # eval 合作率达到该阈值时触发 lr 衰减
-        lr_decay_multiplier=0.5    # lr 衰减乘子（乘在当前 lr 上）
+        lr_decay_multiplier=0.25    # lr 衰减乘子（乘在当前 lr 上）
     )
 #继续训练 配置
     cfg2 = TD3Config(
@@ -612,11 +612,11 @@ if __name__ == "__main__":
         eval_episodes = 5,           # 评估次数略增，平滑曲线
         save_models=True,            # 是否保存 checkpoint
         save_dir=os.path.join(os.path.dirname(__file__), "checkpoints"),  # checkpoint 保存目录（绝对路径）
-        load_run_id=None,            # 若要从已有 run 续训，在此填入 run_id
+        load_run_id='20251119_230050第一版T3D较好效果',            # 若要从已有 run 续训，在此填入 run_id
         save_best=True,              # eval 表现更好时是否保存 best_*.pt
         early_stop_patience=15,       # 若 >0，则 eval reward 连续若干次未提升时提前停止
         min_steps_for_early_stop=600_000,  # 早停生效的最小 step，避免一开始就早停
-        lr_decay_fC_threshold= 0.65,  # eval 合作率达到该阈值时触发 lr 衰减
+        lr_decay_fC_threshold= 0.7,  # eval 合作率达到该阈值时触发 lr 衰减
         lr_decay_multiplier=0.25    # lr 衰减乘子（乘在当前 lr 上）
     )
     # 若需要仅评估已有模型，可在这里配置
