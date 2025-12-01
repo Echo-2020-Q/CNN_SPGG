@@ -585,7 +585,7 @@ if __name__ == "__main__":
         noise_clip=0.05,             # target smoothing 噪声截断范围
         expl_noise=0.001,             # 行为策略探索噪声
         policy_delay=2,              # policy 延迟更新频率
-        batch_size=32,               # 每次更新采样的 batch 大小
+        batch_size=256,               # 每次更新采样的 batch 大小
         replay_size=500_000,         # 经验回放容量
         total_steps=1500_000,         # 总交互步数
         start_steps=0,            # 纯探索步数 如果加载模型的话就调低一点啊啊啊   10_000
