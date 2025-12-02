@@ -1,3 +1,4 @@
+
 """
 TD3 trainer for the deterministic planner in the spatial public-goods game.
 
@@ -873,3 +874,4 @@ if __name__ == "__main__":
             cfg=cfg1,
             initial_R=50,                 # 初始资源
         )
+
