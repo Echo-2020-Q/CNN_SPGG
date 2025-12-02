@@ -82,35 +82,69 @@ class TD3Config:
     lr_decay_fC_threshold: float = 0.7  # eval 合作率达到该阈值时触发 lr 衰减
     lr_decay_multiplier: float = 0.5    # lr 衰减乘子（乘在当前 lr 上）
     rollout_workers: int | None = None  # 并行采样进程数；None 表示自动取 cpu_count 范围内的值
+    samples_per_step: int | None = None  # 每个训练 step 从 data_queue 最多取多少条样本；None 默认等于 rollout_workers 或 4
 
 
 class ReplayBuffer:
     """
     简单的经验回放缓冲区：
     存储 (state, action, reward, next_state, done) 五元组。
+
+    为了避免 deque + random.sample 在大容量下的 O(N) 开销，
+    这里使用基于 numpy 的环形缓冲区，实现 O(1) 随机索引与向量化采样。
     """
 
     def __init__(self, capacity: int):
         self.capacity = capacity
-        self.buffer: Deque[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]] = deque(maxlen=capacity)
+        self.size = 0
+        self.ptr = 0
+        # 延迟初始化存储数组，首次 add 时按样本形状分配
+        self.states: np.ndarray | None = None
+        self.actions: np.ndarray | None = None
+        self.rewards: np.ndarray | None = None
+        self.next_states: np.ndarray | None = None
+        self.dones: np.ndarray | None = None
 
     def add(self, s, a, r, s2, done):
         """追加一个 transition 到缓冲区。"""
-        self.buffer.append((s, a, r, s2, done))
+        s_arr = np.asarray(s, dtype=np.float32)
+        a_arr = np.asarray(a, dtype=np.float32)
+        s2_arr = np.asarray(s2, dtype=np.float32)
+        r_val = float(r)
+        d_val = float(done)
+
+        if self.states is None:
+            # 首次调用时根据样本形状分配环形缓冲区
+            self.states = np.empty((self.capacity, *s_arr.shape), dtype=np.float32)
+            self.actions = np.empty((self.capacity, *a_arr.shape), dtype=np.float32)
+            self.rewards = np.empty((self.capacity,), dtype=np.float32)
+            self.next_states = np.empty((self.capacity, *s2_arr.shape), dtype=np.float32)
+            self.dones = np.empty((self.capacity,), dtype=np.float32)
+
+        idx = self.ptr
+        self.states[idx] = s_arr
+        self.actions[idx] = a_arr
+        self.rewards[idx] = r_val
+        self.next_states[idx] = s2_arr
+        self.dones[idx] = d_val
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        if self.size < self.capacity:
+            self.size += 1
 
     def __len__(self):
-        return len(self.buffer)
+        return self.size
 
     def sample(self, batch_size: int):
         """随机采样一个 batch，并按 numpy 数组打包返回。"""
-        batch = random.sample(self.buffer, batch_size)
-        s, a, r, s2, d = zip(*batch)
+        assert self.size > 0 and self.states is not None
+        idxs = np.random.randint(0, self.size, size=batch_size)
         return (
-            np.stack(s, axis=0),
-            np.stack(a, axis=0),
-            np.array(r, dtype=np.float32),
-            np.stack(s2, axis=0),
-            np.array(d, dtype=np.float32),
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
         )
 
 
@@ -371,8 +405,10 @@ def train_td3(
             break
 
         # 1) 从 data_queue 拉取若干条样本填充 replay
+        #    单步最多拉取与并行 worker 数量同量级的样本，避免队列被迅速塞满导致 worker 阻塞
+        max_fetch = cfg.samples_per_step or (cfg.rollout_workers or 4)
         fetched = 0
-        while fetched < 4:
+        while fetched < max_fetch:
             try:
                 tr = data_queue.get(timeout=0.01)
             except Exception:
@@ -751,7 +787,9 @@ if __name__ == "__main__":
         early_stop_fC_threshold=0.7,  # eval 合作率高于该阈值且 reward 未提升才允许早停
         lr_decay_fC_threshold= 0.7,  # eval 合作率高于该阈值时触发 lr 衰减
         lr_decay_multiplier=0.25,    # lr 衰减乘子（乘在当前 lr 上）
-        rollout_workers=24,        # 并行采样进程数（默认自动）
+        rollout_workers = 24,        # 并行采样进程数（默认自动）
+        samples_per_step = 64  # 每个训练 step 从 data_queue 最多取多少条样本；None 默认等于 rollout_workers 或 4
+
     )
 #继续训练 配置
     cfg2 = TD3Config(
@@ -780,6 +818,8 @@ if __name__ == "__main__":
         lr_decay_fC_threshold= 0.7,  # eval 合作率高于该阈值时触发 lr 衰减
         lr_decay_multiplier=0.25,    # lr 衰减乘子（乘在当前 lr 上）
         rollout_workers=24,        # 并行采样进程数（默认自动）
+        samples_per_step = 64  # 每个训练 step 从 data_queue 最多取多少条样本；None 默认等于 rollout_workers 或 4
+
     )
     # 若需要仅评估已有模型，可在这里配置
     EVAL_ONLY = False           #是否只是加载模型并且评估，不训练

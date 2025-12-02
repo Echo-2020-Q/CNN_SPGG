@@ -163,45 +163,84 @@ class PublicGoodsEnv:
             info: 一些统计量，用于观测系统状态（如合作率等）。
         """
         L, r = self.L, self.r
-        new_r = np.zeros_like(self.R)   # 存 r_i(t)
+        new_r = np.zeros_like(self.R, dtype=np.float32)   # 存 r_i(t)
 
         # 清空上一轮的 P_center
         self.P_center.fill(0.0)
 
-        # --------- 1. 组内公共品博弈，累积 r_i(t) ----------
-        # 这里遍历“所有以 (i,j) 为中心的小组”，每个小组都产生一个公共池并在 5 个成员之间分配。
-        # 注意：同一个个体会出现在多个小组中，因此 new_r[x,y] 会被多次累加。
-        for i in range(L):
-            for j in range(L):
-                # 当前小组的五个成员坐标（周期边界）
-                up    = self.idxs[(i - 1) % L], j
-                down  = self.idxs[(i + 1) % L], j
-                left  = i, self.idxs[(j - 1) % L]
-                right = i, self.idxs[(j + 1) % L]
-                mid   = (i, j)
-                group_coords = [mid, up, down, left, right]
+        # --------- 1. 组内公共品博弈，累积 r_i(t)（向量化实现） ----------
+        # can_cooperate: 当前轮真正能合作的个体（策略为 C 且资源 >= coop_cost）
+        can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
 
-                # 合作者数量 n_c：策略为 C 且资源充足的个体才算合作者
-                n_c = sum((self.strategy[x, y] == 1) and (self.R[x, y] >= self.coop_cost) for x, y in group_coords)
+        # 以每个格点为“中心小组”视角，计算该小组中 5 个成员的可合作标记
+        mid_can = can_cooperate.astype(np.float32)                     # (L,L)
+        up_can = np.roll(can_cooperate, shift=1, axis=0).astype(np.float32)    # 上邻居位于 (i-1,j)
+        down_can = np.roll(can_cooperate, shift=-1, axis=0).astype(np.float32) # 下邻居位于 (i+1,j)
+        left_can = np.roll(can_cooperate, shift=1, axis=1).astype(np.float32)  # 左邻居位于 (i,j-1)
+        right_can = np.roll(can_cooperate, shift=-1, axis=1).astype(np.float32)# 右邻居位于 (i,j+1)
 
-                # 公共池 P = r * n_c
-                P = r * n_c
-                
-                # 记录以 (i,j) 为中心小组的 P 大小
-                self.P_center[i, j] = P
+        # 合作者数量 n_c：策略为 C 且资源充足的个体才算合作者
+        n_c = mid_can + up_can + down_can + left_can + right_can      # (L,L)
 
-                # 当前小组的局部分配比例向量 π_ij (mid, up, down, left, right)
-                # 注意：外部虽然应该已经给出概率向量，但这里仍做一次归一化以防数值偏差。
-                pi_vec = pi_field[i, j]          # shape (5,)
-                pi_vec = pi_vec / (pi_vec.sum() + 1e-8)  # 保险归一化
+        # 公共池 P = r * n_c，记录到以 (i,j) 为中心的小组公共池 self.P_center
+        self.P_center[:, :] = r * n_c.astype(np.float32)
 
-                # 结算本小组对每个成员的收益
-                for k, (x, y) in enumerate(group_coords):
-                    income = pi_vec[k] * P
-                    # 只有资源充足且策略为 C 的个体才真正付出成本
-                    if (self.strategy[x, y] == 1) and (self.R[x, y] >= self.coop_cost):
-                        income -= 1.0
-                    new_r[x, y] += income
+        # 当前小组的局部分配比例向量 π_ij (mid, up, down, left, right)
+        # 注意：外部虽然应该已经给出概率向量，但这里仍做一次归一化以防数值偏差。
+        pi = np.asarray(pi_field, dtype=np.float32)  # (L,L,5)
+        denom = pi.sum(axis=-1, keepdims=True) + 1e-8
+        pi = pi / denom
+
+        # 每个小组对 5 个成员的收益（尚未扣成本）：income_role = pi_role * P_center
+        P = self.P_center.astype(np.float32)
+        income_mid_center = P * pi[:, :, 0]
+        income_up_center = P * pi[:, :, 1]
+        income_down_center = P * pi[:, :, 2]
+        income_left_center = P * pi[:, :, 3]
+        income_right_center = P * pi[:, :, 4]
+
+        # 将“以小组为中心”的收益映射到具体个体坐标：
+        # - 自己是中心：不需要平移
+        # - 自己是某个邻居：把对应 role 的地图 roll 回该邻居坐标
+        income_mid_agent = income_mid_center
+        income_up_agent = np.roll(income_up_center, shift=-1, axis=0)     # 每个个体作为某组的 up 成员
+        income_down_agent = np.roll(income_down_center, shift=1, axis=0)  # 作为 down 成员
+        income_left_agent = np.roll(income_left_center, shift=-1, axis=1) # 作为 left 成员
+        income_right_agent = np.roll(income_right_center, shift=1, axis=1)# 作为 right 成员
+
+        income_total = (
+            income_mid_agent
+            + income_up_agent
+            + income_down_agent
+            + income_left_agent
+            + income_right_agent
+        )
+
+        # 成本：只有资源充足且策略为 C 的个体才真正付出成本 1
+        # 以“中心小组”视角，每个 role 的成本标记与上面的 *_can 对应；
+        # 再按与收入相同的方式 roll 回个体坐标并求和。
+        cost_mid_center = mid_can
+        cost_up_center = up_can
+        cost_down_center = down_can
+        cost_left_center = left_can
+        cost_right_center = right_can
+
+        cost_mid_agent = cost_mid_center
+        cost_up_agent = np.roll(cost_up_center, shift=-1, axis=0)
+        cost_down_agent = np.roll(cost_down_center, shift=1, axis=0)
+        cost_left_agent = np.roll(cost_left_center, shift=-1, axis=1)
+        cost_right_agent = np.roll(cost_right_center, shift=1, axis=1)
+
+        cost_total = (
+            cost_mid_agent
+            + cost_up_agent
+            + cost_down_agent
+            + cost_left_agent
+            + cost_right_agent
+        )
+
+        # 每个合作者在最多 5 个小组中各付出一次成本 1，正好对应原始实现
+        new_r[:, :] = income_total - cost_total
 
         # --------- 2. 更新累计资源 R_i(t+1) = (1 - decay) * R_i(t) + r_i(t) ----------
         self.r_t = new_r
