@@ -363,6 +363,7 @@ def train_td3(
     # 采样计数（用于 warmup）
     sample_count = 0
     update_step = 0
+    mean_er, mean_ef = float("nan"), float("nan")  # eval 占位，避免未定义
     param_broadcast_interval = 1_000  # 主网络参数下发给 workers 的间隔步数
 
     for step in range(1, cfg.total_steps + 1):
@@ -555,17 +556,17 @@ def train_td3(
                         f"mean_fC={mean_ef:.4f} >= early_stop_fC_threshold={cfg.early_stop_fC_threshold})"
                     )
                     stop_training = True
-        if log_writer is not None:
-            log_writer.writerow([
-                "eval",
-                step,
-                "",
-                "",
-                "",
-                "",
-                mean_er,
-                mean_ef,
-            ])
+            if log_writer is not None:
+                log_writer.writerow([
+                    "eval",
+                    step,
+                    "",
+                    "",
+                    "",
+                    "",
+                    mean_er,
+                    mean_ef,
+                ])
             if tb_writer is not None:
                 tb_writer.add_scalar("eval/reward", mean_er, step)
                 tb_writer.add_scalar("eval/mean_fC", mean_ef, step)
