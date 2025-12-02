@@ -689,7 +689,7 @@ if __name__ == "__main__":
         early_stop_fC_threshold=0.7,  # eval 合作率高于该阈值且 reward 未提升才允许早停
         lr_decay_fC_threshold= 0.7,  # eval 合作率高于该阈值时触发 lr 衰减
         lr_decay_multiplier=0.25,    # lr 衰减乘子（乘在当前 lr 上）
-        rollout_workers=24,        # 并行采样进程数（默认自动）
+        rollout_workers=2,        # 并行采样进程数（默认自动）
     )
 #继续训练 配置
     cfg2 = TD3Config(
