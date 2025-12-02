@@ -5,7 +5,7 @@
 - 载入指定的 actor.pt；
 - 在环境上跑一段轨迹，收集若干状态 + 对应的 actor 输出；
 - 为每个采样到的时刻保存一张可视化图片，包括：
-  - 三个输入通道：当前可合作策略/上一轮策略/归一化公共池；
+  - 四个输入通道：当前可合作策略/上一轮策略/归一化公共池/归一化累计资源；
   - 五个动作通道：mid/up/down/left/right 的分配比例热力图。
 
 用法示例（在 Without_Dirichlet_determin 目录下）：
@@ -80,7 +80,7 @@ def _clean_heatmap(arr: np.ndarray) -> np.ndarray:
 
 def load_actor(actor_path: str, device: str) -> ActorNet:
     """加载已训练的 actor.pt，切到 eval 模式。"""
-    actor = ActorNet().to(device)
+    actor = ActorNet(in_channels=4).to(device)
     actor.load_state_dict(torch.load(actor_path, map_location=device))
     actor.eval()
     return actor
@@ -92,7 +92,7 @@ def select_action(actor: ActorNet, state: np.ndarray, device: str) -> np.ndarray
     这里沿用训练时的确定性前向，但不加任何探索扰动。
     """
     with torch.no_grad():
-        s_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)  # (1,3,L,L)
+        s_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)  # (1,C,L,L)
         pi = actor(s_tensor)  # (1,5,L,L)
         pi_np = pi.cpu().numpy()[0]  # (5,L,L)
         pi_field = np.transpose(pi_np, (1, 2, 0))  # (L,L,5)
@@ -132,13 +132,14 @@ def plot_single_state(
     out_path: str,
 ):
     """
-    保存一张图：3 个输入通道 + 5 个动作通道。
-    - 上排：可合作策略、上一轮策略、归一化公共池
+    保存一张图：4 个输入通道 + 5 个动作通道。
+    - 上排：可合作策略、上一轮策略、归一化公共池、归一化累计资源
     - 下排：mid/up/down/left/right 分配比例（左右合并为箭头场便于直观）
     """
     stra_now = state[0]
     stra_prev = state[1]
     p_center = state[2]
+    r_norm = state[3]
 
     # 动作通道（假定顺序 mid, up, down, left, right）
     mid = pi_field[:, :, 0]
@@ -165,8 +166,9 @@ def plot_single_state(
     axes[0, 2].set_title("P_center_norm")
     fig.colorbar(im2, ax=axes[0, 2], fraction=0.046, pad=0.04)
 
-    axes[0, 3].axis("off")
-    axes[0, 3].text(0.0, 0.5, "Inputs", fontsize=12)
+    im_r = axes[0, 3].imshow(r_norm, cmap="Purples")
+    axes[0, 3].set_title("R_norm (R / R_max)")
+    fig.colorbar(im_r, ax=axes[0, 3], fraction=0.046, pad=0.04)
 
     im3 = axes[1, 0].imshow(mid, vmin=0, vmax=1, cmap="OrRd")
     axes[1, 0].set_title("pi mid")
@@ -250,10 +252,10 @@ def compute_saliency_channels(
     通道级敏感度（全局版）：
     - 对棋盘所有格点的动作输出做敏感度，逐点求梯度；
     - 对每个点的三个通道梯度分别做 0~1 归一化；
-    - 再对所有格点的通道敏感度求平均，得到 (3, L, L) 的全局通道敏感度图。
+  - 再对所有格点的通道敏感度求平均，得到 (4, L, L) 的全局通道敏感度图。
 
     返回:
-        sal_ch (3, L, L)，每个通道均已单独做 0~1 归一化。
+        sal_ch (4, L, L)，每个通道均已单独做 0~1 归一化。
     说明：
         target_row/target_col 参数保留以兼容接口，但在全局版本中不再使用。
     """

@@ -84,11 +84,12 @@ class PublicGoodsEnv:
     def get_state(self):
         """
         构造 CNN 输入状态（提供给 PlannerNet）：
-        1) 当前策略：Stra_now（合作者=1，背叛者=0）
-        2) 上一轮策略：Stra_prev（合作者=1，背叛者=0）
-        3) 当前公共池：P_center（以每个格点为中心小组的 P = r * n_c）
+        1) 当前可合作策略：Stra_now（资源足且策略为 C 的为 1，否则 0）
+        2) 上一轮策略：Stra_prev（上一轮策略为 C 的为 1，否则 0）
+        3) 当前公共池：P_center（以每个格点为中心小组的 P = r * n_c，经 5*r 归一化）
+        4) 当前累计资源：R_norm = R / (coop_cost + 1e-8)，可合作阈值附近约为 1
 
-        输出 shape: (3, L, L)
+        输出 shape: (4, L, L)
         """
         # 当前轮与上一轮的策略（单通道布尔 -> float32），资源不足 coop_cost 视为 D
         can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
@@ -99,7 +100,12 @@ class PublicGoodsEnv:
         # 这样当某个小组 5 个成员全为合作者时，该位置的 P_norm 接近 1，其余情况在 [0,1) 之间。
         P_map = self.P_center.astype(np.float32) / (5.0 * float(self.r) + 1e-8)
 
-        state = np.stack([stra_now, stra_prev, P_map], axis=0)
+        # 累计资源归一化：用“全体满合作时的稳态累计资源”做分母，量级约 5*(r-1)/R_decay
+        # R_{t+1} = (1 - R_decay) R_t + r_i(t)，在 r_i(t)=5*(r-1) 时的稳态解为 5*(r-1)/R_decay
+        denom = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8) + 1e-8
+        R_norm = self.R.astype(np.float32) / denom
+
+        state = np.stack([stra_now, stra_prev, P_map, R_norm], axis=0)
         return state
 
     def _update_strategy_fermi(self, beta=1.0):
@@ -151,7 +157,7 @@ class PublicGoodsEnv:
         π_field: shape (L, L, 5)，每个格点的五维分配比例（mid, up, down, left, right）。
 
         返回:
-            new_state: 下一时刻的状态 (3, L, L)，用于下一步 CNN 输入；
+            new_state: 下一时刻的状态 (4, L, L)，用于下一步 CNN 输入；
             planner_reward: 本回合 planner 的奖励；
             done: 是否到达本 episode 结束（达到最大演化步数 T_max）；
             info: 一些统计量，用于观测系统状态（如合作率等）。

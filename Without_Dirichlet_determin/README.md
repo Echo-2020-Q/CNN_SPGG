@@ -18,12 +18,12 @@ TD3 Planner (Deterministic Actor)
 
 - 策略网络（Actor，确定性）：
   - 文件：`planner_net.py` 中的 `ActorNet`
-  - 输入：`state (B, 3, L, L)`
+  - 输入：`state (B, 4, L, L)`（新增累计资源通道）
   - 输出：`pi (B, 5, L, L)`，每个格点 5 维经过 softmax 后是合法的分配比例。
 
 - 价值网络（Critic，双 Q）：
   - 文件：`planner_net.py` 中的 `CriticNet`
-  - 输入：`state (B, 3, L, L)` 与 `action (B, 5, L, L)`
+  - 输入：`state (B, 4, L, L)` 与 `action (B, 5, L, L)`
   - 输出：标量 `Q(s, a)`。
 
 - 训练逻辑：
@@ -46,12 +46,14 @@ TD3 Planner (Deterministic Actor)
 
 文件：`env.py`
 
-- 状态 `state`：shape `(3, L, L)`，由 `get_state()` 构造：
-  1. `Stra_now`：当前策略（合作者=1，背叛者=0）
+- 状态 `state`：shape `(4, L, L)`，由 `get_state()` 构造：
+  1. `Stra_now`：当前可合作策略（资源足且策略为 C 为 1，否则 0）
   2. `Stra_prev`：上一轮策略
   3. `P_center_norm`：以每个格点为中心小组的公共池大小 `P_center` 做归一化后的结果  
      - 原始公共池：`P_center[i,j] = r * n_c(i,j)`，其中 `n_c` 为该小组的合作者数（最多 5）  
      - 归一化：`P_center_norm = P_center / (5 * r)`，理论上落在 `[0, 1]` 左右，有利于网络训练
+  4. `R_norm`：累计资源归一化，分母取“全局满合作时的稳态累计资源”  
+     `denom ≈ 5*(r-1)/R_decay`，对应 `R_{t+1} = (1-R_decay)R_t + 5*(r-1)` 的稳态解
 
 - 动作 `pi_field`：shape `(L, L, 5)`
   - 每个格点 `(i,j)` 对应一个 5 维向量：`[mid, up, down, left, right]`
@@ -90,15 +92,15 @@ TD3 Planner (Deterministic Actor)
   - 用于抽取棋盘上的局部交互特征。
 
 - `ActorNet`（确定性规划者）：
-  - 输入：`state (B, 3, L, L)`
+  - 输入：`state (B, 4, L, L)`
   - 结构：
-    - `ConvBody(3, base_channels=32)`
+    - `ConvBody(4, base_channels=32)`
     - `policy_head: 1×1 Conv` 输出 5 通道 logits
     - 前向中做 softmax 得到 `pi (B, 5, L, L)` 概率分布
   - 训练和行为时的探索并不在 `ActorNet` 内部实现，而是在 `global_trainer.py` 的 `select_action` 中对 logits 加高斯噪声。
 
 - `CriticNet`（单个 Q 网络）：
-  - 输入：`state (B, 3, L, L)` 和 `action (B, 5, L, L)`
+  - 输入：`state (B, 4, L, L)` 和 `action (B, 5, L, L)`
   - 结构：
     - 在通道上 concat 得到 `(B, 8, L, L)`，喂入 `ConvBody(8, base_channels=32)`
     - 全局平均池化 + MLP 输出标量 `Q(s,a)`。

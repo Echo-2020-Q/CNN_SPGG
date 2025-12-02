@@ -16,6 +16,9 @@ TD3 trainer for the deterministic planner in the spatial public-goods game.
 from __future__ import annotations
 
 import random
+import multiprocessing as mp
+from multiprocessing.queues import Queue as MPQueue
+from multiprocessing.synchronize import Event as MPEvent
 from dataclasses import dataclass
 from typing import Deque, Tuple
 from collections import deque
@@ -67,8 +70,10 @@ class TD3Config:
     save_best: bool = True       # eval 表现更好时是否保存 best_*.pt
     early_stop_patience: int = 0 # 若 >0，则 eval reward 连续若干次未提升时提前停止
     min_steps_for_early_stop: int = 0  # 早停生效的最小 step，默认 0 表示从一开始就生效
+    early_stop_fC_threshold: float = 0.0  # 仅当 eval mean_fC 高于该阈值时才允许早停
     lr_decay_fC_threshold: float = 0.7  # eval 合作率达到该阈值时触发 lr 衰减
     lr_decay_multiplier: float = 0.5    # lr 衰减乘子（乘在当前 lr 上）
+    rollout_workers: int | None = None  # 并行采样进程数；None 表示自动取 cpu_count 范围内的值
 
 
 class ReplayBuffer:
@@ -101,10 +106,23 @@ class ReplayBuffer:
         )
 
 
+@dataclass
+class Transition:
+    """跨进程传递的单步样本。"""
+    s: np.ndarray
+    a: np.ndarray
+    r: float
+    s2: np.ndarray
+    done: bool
+
+
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
     with torch.no_grad():
         for tp, sp in zip(target.parameters(), source.parameters()):
             tp.data.mul_(1.0 - tau).add_(tau * sp.data)
+
+
+STATE_CHANNELS = 4  # stra_now, stra_prev, P_center_norm, R_norm
 
 
 def select_action(actor: ActorNet, state: np.ndarray, device: str, expl_noise: float, training: bool) -> np.ndarray:
@@ -113,7 +131,7 @@ def select_action(actor: ActorNet, state: np.ndarray, device: str, expl_noise: f
 
     参数:
         actor: 训练中的 ActorNet
-        state: numpy 数组 (3, L, L)，当前棋盘状态
+        state: numpy 数组 (STATE_CHANNELS, L, L)，当前棋盘状态
         device: 运行设备标识
         expl_noise: 探索噪声标准差（加在 logits 上）
         training: 若为 True，则加噪声；评估时可设为 False
@@ -123,7 +141,7 @@ def select_action(actor: ActorNet, state: np.ndarray, device: str, expl_noise: f
     """
     actor.eval()
     with torch.no_grad():
-        s_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)  # (1,3,L,L)
+        s_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)  # (1,C,L,L)
         feat = actor.body(s_tensor)  # 直接访问 body + policy_head，便于在 logits 上加噪声
         logits = actor.policy_head(feat)  # (1,5,L,L)
         if training and expl_noise > 0.0:
@@ -134,6 +152,57 @@ def select_action(actor: ActorNet, state: np.ndarray, device: str, expl_noise: f
         pi_np = np.transpose(pi_np, (1, 2, 0))  # -> (L,L,5)，env.step 需要这种格式
     actor.train()
     return pi_np
+
+
+def rollout_worker(
+    worker_id: int,
+    env_kwargs: dict,
+    expl_noise: float,
+    data_queue: MPQueue,
+    param_queue: MPQueue,
+    stop_event: MPEvent,
+):
+    """
+    多进程采样 worker：在 CPU 上跑一个 env，使用收到的最新 actor 参数生成样本。
+    """
+    env = PublicGoodsEnv(**env_kwargs)
+    actor = ActorNet(in_channels=STATE_CHANNELS).to("cpu")
+    actor.eval()
+
+    # 初次拉取参数（阻塞等待）
+    state_dict = param_queue.get()
+    actor.load_state_dict(state_dict)
+
+    state = env.reset()
+    while not stop_event.is_set():
+        # 如有新参数，更新本地 actor
+        try:
+            while True:
+                state_dict = param_queue.get_nowait()
+                actor.load_state_dict(state_dict)
+        except Exception:
+            pass
+
+        pi_field = select_action(actor, state, device="cpu", expl_noise=expl_noise, training=True)
+        next_state, reward, done, info = env.step(pi_field)
+
+        tr = Transition(
+            s=state.astype(np.float32),
+            a=pi_field.astype(np.float32),
+            r=float(reward),
+            s2=next_state.astype(np.float32),
+            done=bool(done),
+        )
+        data_queue.put(tr)
+
+        state = next_state if not done else env.reset()
+
+    # 退出前清空一次参数队列，避免主进程阻塞（可选）
+    try:
+        while True:
+            param_queue.get_nowait()
+    except Exception:
+        pass
 
 
 def train_td3(
@@ -153,22 +222,22 @@ def train_td3(
         L=L,
         r=r,
         episode_length=episode_length,
+        # TD3 用即时奖励，关闭累计式奖励避免非平稳 target
         use_cumulative_planner_reward=False,
     )
     # 如指定 initial_R，则覆盖环境默认初始资源
     if initial_R is not None:
         env_kwargs["initial_R"] = initial_R
-    env = PublicGoodsEnv(**env_kwargs)
 
     # 主网络：Actor 和两个 Critic
-    actor = ActorNet().to(device)
-    actor_target = ActorNet().to(device)
+    actor = ActorNet(in_channels=STATE_CHANNELS).to(device)
+    actor_target = ActorNet(in_channels=STATE_CHANNELS).to(device)
     actor_target.load_state_dict(actor.state_dict())
 
-    critic1 = CriticNet().to(device)
-    critic2 = CriticNet().to(device)
-    critic1_target = CriticNet().to(device)
-    critic2_target = CriticNet().to(device)
+    critic1 = CriticNet(state_channels=STATE_CHANNELS).to(device)
+    critic2 = CriticNet(state_channels=STATE_CHANNELS).to(device)
+    critic1_target = CriticNet(state_channels=STATE_CHANNELS).to(device)
+    critic2_target = CriticNet(state_channels=STATE_CHANNELS).to(device)
     critic1_target.load_state_dict(critic1.state_dict())
     critic2_target.load_state_dict(critic2.state_dict())
 
@@ -178,6 +247,9 @@ def train_td3(
     # 学习率调度器：当 eval 合作率达到阈值时手动降低 lr（乘以 0.5）
     actor_sched = MultiplicativeLR(actor_opt, lr_lambda=lambda _: cfg.lr_decay_multiplier)
     critic_sched = MultiplicativeLR(critic_opt, lr_lambda=lambda _: cfg.lr_decay_multiplier)
+    # 记录初始学习率，便于阈值恢复
+    init_actor_lr = actor_opt.param_groups[0]["lr"]
+    init_critic_lr = critic_opt.param_groups[0]["lr"]
 
     # 运行 ID（用于保存模型与图像），时间戳形式
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -198,6 +270,37 @@ def train_td3(
             print(f"[TD3] Loaded models from run_id={cfg.load_run_id}")
         except FileNotFoundError:
             print(f"[TD3] Warning: checkpoint for run_id={cfg.load_run_id} not found, start from scratch.")
+
+    # 多进程采样队列与 worker 管理
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # start_method 可能已在主进程设过，忽略
+        pass
+
+    num_workers = cfg.rollout_workers or max(1, min(8, mp.cpu_count()))
+    data_queue: MPQueue = mp.Queue(maxsize=10_000)
+    param_queue: MPQueue = mp.Queue()
+    stop_event: MPEvent = mp.Event()
+
+    def _actor_state_dict_cpu():
+        return {k: v.detach().cpu() for k, v in actor.state_dict().items()}
+
+    # 初次广播 actor 参数给所有 worker
+    init_sd = _actor_state_dict_cpu()
+    for _ in range(num_workers):
+        param_queue.put(init_sd)
+
+    workers = []
+    for wid in range(num_workers):
+        p = mp.Process(
+            target=rollout_worker,
+            args=(wid, env_kwargs, cfg.expl_noise, data_queue, param_queue, stop_event),
+        )
+        p.daemon = True
+        p.start()
+        workers.append(p)
+    print(f"[TD3] Started {num_workers} rollout workers.")
 
     replay = ReplayBuffer(cfg.replay_size)
 
@@ -230,42 +333,35 @@ def train_td3(
     else:
         os.makedirs(run_dir, exist_ok=True)
 
-    # 初始化环境与 episode 统计
-    state = env.reset()
-    episode_reward = 0.0
-    episode_fC_sum = 0.0
-    episode_len = 0
+    # 采样计数（用于 warmup）
+    sample_count = 0
+    update_step = 0
+    param_broadcast_interval = 1_000  # 主网络参数下发给 workers 的间隔步数
 
     for step in range(1, cfg.total_steps + 1):
         if stop_training:
             break
-        # 1) 选动作
-        if step < cfg.start_steps:
-            # 前若干步：纯探索策略，这里简单使用均匀分配比例
-            pi_field = np.ones((L, L, 5), dtype=np.float32) / 5.0
-        else:
-            pi_field = select_action(actor, state, device, cfg.expl_noise, training=True)
 
-        # 2) 和环境交互
-        next_state, reward, done, info = env.step(pi_field)
-        f_c = float(info.get("f_C", 0.0))
+        # 1) 从 data_queue 拉取若干条样本填充 replay
+        fetched = 0
+        while fetched < 4:
+            try:
+                tr = data_queue.get(timeout=0.01)
+            except Exception:
+                break
+            replay.add(tr.s, tr.a, tr.r, tr.s2, tr.done)
+            sample_count += 1
+            fetched += 1
 
-        replay.add(state, pi_field, reward, next_state, done)
-
-        state = next_state
-        episode_reward += reward
-        episode_fC_sum += f_c
-        episode_len += 1
-
-        # 3) 更新网络（当 replay 中样本数量足够时）
-        if len(replay) >= cfg.batch_size:
+        # 2) 更新网络（当 replay 中样本数量足够时）
+        if len(replay) >= cfg.batch_size and sample_count >= cfg.start_steps:
             # 3.1 采样 batch
             s_np, a_np, r_np, s2_np, d_np = replay.sample(cfg.batch_size)
 
-            s = torch.from_numpy(s_np).float().to(device)       # (B,3,L,L)
+            s = torch.from_numpy(s_np).float().to(device)       # (B,STATE_CHANNELS,L,L)
             a = torch.from_numpy(a_np).float().to(device)       # (B,L,L,5)
             r_batch = torch.from_numpy(r_np).float().to(device)       # (B,)
-            s2 = torch.from_numpy(s2_np).float().to(device)     # (B,3,L,L)
+            s2 = torch.from_numpy(s2_np).float().to(device)     # (B,STATE_CHANNELS,L,L)
             d = torch.from_numpy(d_np).float().to(device)       # (B,)
 
             # 转动作为 (B,5,L,L)
@@ -285,7 +381,7 @@ def train_td3(
                 q1_target = critic1_target(s2, a2)
                 q2_target = critic2_target(s2, a2)
                 q_target = torch.min(q1_target, q2_target)
-                target = r + cfg.gamma * (1.0 - d) * q_target
+                target = r_batch + cfg.gamma * (1.0 - d) * q_target
 
             # 3.3 更新两个 critic
             q1 = critic1(s, a_t)
@@ -299,8 +395,9 @@ def train_td3(
 
             critic_loss_hist.append(float(critic_loss.item()))
 
+            update_step += 1
             # 3.4 延迟更新 actor 和 target 网络（policy delay）
-            if step % cfg.policy_delay == 0:
+            if update_step % cfg.policy_delay == 0:
                 # actor_loss = - E_s [ Q1(s, pi(s)) ]
                 pi = actor(s)  # (B,5,L,L)
                 actor_loss = -critic1(s, pi).mean()
@@ -316,33 +413,13 @@ def train_td3(
                 soft_update(critic1_target, critic1, cfg.tau)
                 soft_update(critic2_target, critic2, cfg.tau)
 
-        # 4) episode 结束处理：打印本 episode 的累计 reward 和平均合作率
-        if done or episode_len >= episode_length:
-            mean_fC = episode_fC_sum / max(1, episode_len)
-            step_rewards.append(episode_reward)
-            step_fCs.append(mean_fC)
-            print(
-                f"[TD3] step={step}, episode_len={episode_len}, "
-                f"episode_reward={episode_reward:.4f}, mean_fC={mean_fC:.4f}"
-            )
-            if log_writer is not None:
-                log_writer.writerow([
-                    "train_episode",
-                    step,
-                    episode_reward,
-                    mean_fC,
-                    "",
-                    "",
-                    "",
-                    "",
-                ])
+        # 3) 定期把最新 actor 参数广播给 workers
+        if step % param_broadcast_interval == 0:
+            cpu_sd = {k: v.detach().cpu() for k, v in actor.state_dict().items()}
+            for _ in range(num_workers):
+                param_queue.put(cpu_sd)
 
-            state = env.reset()
-            episode_reward = 0.0
-            episode_fC_sum = 0.0
-            episode_len = 0
-
-        # 5) 定期做 eval（关掉探索噪声，评估当前策略表现）
+        # 4) 定期做 eval（关掉探索噪声，评估当前策略表现）
         if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
             # 使用一个新的 env 做评估，避免干扰训练 env / replay
             eval_env = PublicGoodsEnv(
@@ -375,13 +452,25 @@ def train_td3(
             print(
                 f"[Eval] step={step}, eval_reward={mean_er:.4f}, eval_mean_fC={mean_ef:.4f}"
             )
-            # 若合作率达到阈值且尚未降低过 lr，则将 actor/critic lr 乘以 0.5
+            # 若合作率高于阈值且尚未降低过 lr，则将 actor/critic lr 乘以衰减系数
             if (not lr_lowered) and (mean_ef > cfg.lr_decay_fC_threshold):
                 actor_sched.step()
                 critic_sched.step()
                 lr_lowered = True
                 print(
                     f"[LR] eval_mean_fC={mean_ef:.4f} > {cfg.lr_decay_fC_threshold}, 降低学习率，"
+                    f"actor_lr={actor_opt.param_groups[0]['lr']:.6g}, "
+                    f"critic_lr={critic_opt.param_groups[0]['lr']:.6g}"
+                )
+            # 若之前降低过 lr 且合作率再次跌回阈值以下，则恢复到初始 lr，允许后续再次衰减
+            elif lr_lowered and (mean_ef <= cfg.lr_decay_fC_threshold):
+                for pg in actor_opt.param_groups:
+                    pg["lr"] = init_actor_lr
+                for pg in critic_opt.param_groups:
+                    pg["lr"] = init_critic_lr
+                lr_lowered = False
+                print(
+                    f"[LR] eval_mean_fC={mean_ef:.4f} <= {cfg.lr_decay_fC_threshold}, 恢复学习率，"
                     f"actor_lr={actor_opt.param_groups[0]['lr']:.6g}, "
                     f"critic_lr={critic_opt.param_groups[0]['lr']:.6g}"
                 )
@@ -403,10 +492,12 @@ def train_td3(
                     cfg.early_stop_patience > 0
                     and step >= cfg.min_steps_for_early_stop
                     and since_best >= cfg.early_stop_patience
+                    and mean_ef >= cfg.early_stop_fC_threshold
                 ):
                     print(
                         f"[Eval] Early stopping triggered at step={step} "
-                        f"(no improvement for {since_best} evals, min_steps={cfg.min_steps_for_early_stop})"
+                        f"(no improvement for {since_best} evals, min_steps={cfg.min_steps_for_early_stop}, "
+                        f"mean_fC={mean_ef:.4f} >= early_stop_fC_threshold={cfg.early_stop_fC_threshold})"
                     )
                     stop_training = True
             if log_writer is not None:
@@ -484,6 +575,11 @@ def train_td3(
         out_path = os.path.join(run_dir, "td3_eval_fC.png") if cfg.save_models else "td3_eval_fC.png"
         plt.savefig(out_path)
         plt.close()
+
+    # 结束采样进程
+    stop_event.set()
+    for p in workers:
+        p.join(timeout=5.0)
 
     if log_file is not None:
         log_file.close()
@@ -576,12 +672,12 @@ if __name__ == "__main__":
         tau=0.005,                   # target 网络软更新系数
         policy_noise=0.03,           # target smoothing 噪声强度
         noise_clip=0.05,             # target smoothing 噪声截断范围
-        expl_noise=0.00,             # 行为策略探索噪声
+        expl_noise=0.005,             # 行为策略探索噪声
         policy_delay=2,              # policy 延迟更新频率
-        batch_size=32,               # 每次更新采样的 batch 大小
-        replay_size=500_000,         # 经验回放容量
-        total_steps=1500_000,         # 总交互步数
-        start_steps=10_000,          # 纯探索步数
+        batch_size=1024,               # 每次更新采样的 batch 大小
+        replay_size = 300_000,         # 经验回放容量
+        total_steps=3_000_000,         # 总交互步数
+        start_steps=50_000,          # 纯探索步数
         eval_interval=6_000,         # 评估间隔（<=0 表示不评估）
         eval_episodes = 5,           # 评估次数略增，平滑曲线
         save_models=True,            # 是否保存 checkpoint
@@ -590,8 +686,10 @@ if __name__ == "__main__":
         save_best=True,              # eval 表现更好时是否保存 best_*.pt
         early_stop_patience=10,       # 若 >0，则 eval reward 连续若干次未提升时提前停止
         min_steps_for_early_stop=600_000,  # 提前停止前的最小训练步数
-        lr_decay_fC_threshold= 0.7,  # eval 合作率达到该阈值时触发 lr 衰减
-        lr_decay_multiplier=0.25    # lr 衰减乘子（乘在当前 lr 上）
+        early_stop_fC_threshold=0.7,  # eval 合作率高于该阈值且 reward 未提升才允许早停
+        lr_decay_fC_threshold= 0.7,  # eval 合作率高于该阈值时触发 lr 衰减
+        lr_decay_multiplier=0.25,    # lr 衰减乘子（乘在当前 lr 上）
+        rollout_workers=24,        # 并行采样进程数（默认自动）
     )
 #继续训练 配置
     cfg2 = TD3Config(
@@ -604,7 +702,7 @@ if __name__ == "__main__":
         noise_clip=0.05,             # target smoothing 噪声截断范围
         expl_noise=0.005,             # 行为策略探索噪声
         policy_delay=2,              # policy 延迟更新频率
-        batch_size=256,               # 每次更新采样的 batch 大小
+        batch_size=512,               # 每次更新采样的 batch 大小
         replay_size=500_000,         # 经验回放容量
         total_steps=1500_000,         # 总交互步数
         start_steps=0,            # 纯探索步数 如果加载模型的话就调低一点啊啊啊   10_000
@@ -612,12 +710,14 @@ if __name__ == "__main__":
         eval_episodes = 5,           # 评估次数略增，平滑曲线
         save_models=True,            # 是否保存 checkpoint
         save_dir=os.path.join(os.path.dirname(__file__), "checkpoints"),  # checkpoint 保存目录（绝对路径）
-        load_run_id='20251119_230050第一版T3D较好效果',            # 若要从已有 run 续训，在此填入 run_id
+        load_run_id=None,            # 若要从已有 run 续训，在此填入 run_id
         save_best=True,              # eval 表现更好时是否保存 best_*.pt
         early_stop_patience=15,       # 若 >0，则 eval reward 连续若干次未提升时提前停止
         min_steps_for_early_stop=600_000,  # 早停生效的最小 step，避免一开始就早停
-        lr_decay_fC_threshold= 0.7,  # eval 合作率达到该阈值时触发 lr 衰减
-        lr_decay_multiplier=0.25    # lr 衰减乘子（乘在当前 lr 上）
+        early_stop_fC_threshold=0.7,  # eval 合作率高于该阈值且 reward 未提升才允许早停
+        lr_decay_fC_threshold= 0.7,  # eval 合作率高于该阈值时触发 lr 衰减
+        lr_decay_multiplier=0.25,    # lr 衰减乘子（乘在当前 lr 上）
+        rollout_workers=24,        # 并行采样进程数（默认自动）
     )
     # 若需要仅评估已有模型，可在这里配置
     EVAL_ONLY = False           #是否只是加载模型并且评估，不训练
@@ -668,6 +768,6 @@ if __name__ == "__main__":
             L=25,                        # 棋盘边长
             r=4.0,                       # 公共物品放大因子
             episode_length=150,          # 每个 episode 的最大步数
-            cfg=cfg2,
+            cfg=cfg1,
             initial_R=50,                 # 初始资源
         )
