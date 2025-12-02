@@ -110,42 +110,42 @@ class PublicGoodsEnv:
 
     def _update_strategy_fermi(self, beta=1.0):
         """
-        费米更新规则（同步更新版本）：
-        每个个体 i 随机选一个邻居 j，根据 r_j - r_i 的差值决定是否模仿 j 的策略。
-
-        直观理解：
-        - 若邻居收益更高 (r_j > r_i)，模仿概率接近 1；
-        - 若邻居收益更低 (r_j < r_i)，模仿概率接近 0；
-        - beta 控制“理性程度”：beta 越大，对收益差越敏感。
+        费米更新规则（同步更新版本，向量化）：
+        每个个体随机选一个邻居，根据 r_j - r_i 的差值决定是否模仿邻居的策略。
         """
         L = self.L
+        # 随机方向：0=up,1=down,2=left,3=right
+        dir_idx = np.random.randint(0, 4, size=(L, L))
+
+        # 预先 roll 出四个方向的 r_t 和 strategy
+        r_up = np.roll(self.r_t, shift=1, axis=0)
+        r_down = np.roll(self.r_t, shift=-1, axis=0)
+        r_left = np.roll(self.r_t, shift=1, axis=1)
+        r_right = np.roll(self.r_t, shift=-1, axis=1)
+
+        s_up = np.roll(self.strategy, shift=1, axis=0)
+        s_down = np.roll(self.strategy, shift=-1, axis=0)
+        s_left = np.roll(self.strategy, shift=1, axis=1)
+        s_right = np.roll(self.strategy, shift=-1, axis=1)
+
+        # 按随机方向选邻居的 r_j / s_j
+        neigh_r = np.take_along_axis(
+            np.stack([r_up, r_down, r_left, r_right], axis=-1), dir_idx[..., None], axis=-1
+        ).squeeze(-1)
+        neigh_s = np.take_along_axis(
+            np.stack([s_up, s_down, s_left, s_right], axis=-1), dir_idx[..., None], axis=-1
+        ).squeeze(-1)
+
+        ri = self.r_t
+        diff = neigh_r - ri
+        x = -beta * diff
+        x = np.clip(x, -60.0, 60.0)
+        prob = 1.0 / (1.0 + np.exp(x))
+
+        # 采样是否模仿邻居
+        mask = np.random.rand(L, L) < prob
         new_strategy = self.strategy.copy()
-
-        for i in range(L):
-            for j in range(L):
-                # 1. 随机选一个邻居（周期边界）
-                #   邻居集合：上、下、左、右（也可以把自己也算进去）
-                neighs = [
-                    ((i - 1) % L, j),
-                    ((i + 1) % L, j),
-                    (i, (j - 1) % L),
-                    (i, (j + 1) % L),
-                ]
-                xj, yj = neighs[np.random.randint(len(neighs))]
-
-                ri = self.r_t[i, j]
-                rj = self.r_t[xj, yj]
-
-                # 2. 费米函数给出模仿概率（加入截断避免 exp 溢出）
-                diff = rj - ri
-                x = -beta * diff
-                # 避免 |x| 过大导致 np.exp 溢出，数值上相当于把极端概率截到接近 0/1
-                x = np.clip(x, -60.0, 60.0)
-                prob = 1.0 / (1.0 + np.exp(x))
-
-                # 3. 以 prob 概率采样是否模仿邻居 j
-                if np.random.rand() < prob:
-                    new_strategy[i, j] = self.strategy[xj, yj]
+        new_strategy[mask] = neigh_s[mask]
 
         # 资源不足 coop_cost 的个体无法保持 / 切换到合作，强制视为 D
         new_strategy[self.R < self.coop_cost] = 0

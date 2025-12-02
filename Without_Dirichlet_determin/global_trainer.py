@@ -27,6 +27,7 @@ import os
 import datetime
 import csv
 import csv
+import math
 
 # 限制单进程内部的线程数，避免多进程采样时把所有 CPU 占满
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -84,6 +85,7 @@ class TD3Config:
     lr_decay_multiplier: float = 0.5    # lr 衰减乘子（乘在当前 lr 上）
     rollout_workers: int | None = None  # 并行采样进程数；None 表示自动取 cpu_count 范围内的值
     samples_per_step: int | None = None  # 每个训练 step 从 data_queue 最多取多少条样本；None 默认等于 rollout_workers 或 4
+    batch_send_size: int = 32  # 每个 worker 累积多少步再打包发送一次，减少 IPC 次数
 
 
 class ReplayBuffer:
@@ -204,6 +206,7 @@ def rollout_worker(
     data_queue: MPQueue,
     param_queue: MPQueue,
     metric_queue: MPQueue,
+    batch_send_size: int,
     stop_event: MPEvent,
 ):
     """
@@ -221,6 +224,7 @@ def rollout_worker(
     ep_reward = 0.0
     ep_fC_sum = 0.0
     ep_len = 0
+    batch_buf: list[Transition] = []
     while not stop_event.is_set():
         # 如有新参数，更新本地 actor
         try:
@@ -240,7 +244,10 @@ def rollout_worker(
             s2=next_state.astype(np.float32),
             done=bool(done),
         )
-        data_queue.put(tr)
+        batch_buf.append(tr)
+        if len(batch_buf) >= batch_send_size:
+            data_queue.put(batch_buf)
+            batch_buf = []
 
         ep_reward += float(reward)
         ep_fC_sum += float(info.get("f_C", 0.0))
@@ -255,6 +262,10 @@ def rollout_worker(
             ep_len = 0
         else:
             state = next_state
+
+    # 退出前把剩余的样本打包发送
+    if batch_buf:
+        data_queue.put(batch_buf)
 
     # 退出前清空一次参数队列，避免主进程阻塞（可选）
     try:
@@ -338,7 +349,7 @@ def train_td3(
         pass
 
     num_workers = cfg.rollout_workers or max(1, min(8, mp.cpu_count()))
-    data_queue: MPQueue = mp.Queue(maxsize=10_000)
+    data_queue: MPQueue = mp.Queue(maxsize=100_000)
     param_queue: MPQueue = mp.Queue()
     metric_queue: MPQueue = mp.Queue(maxsize=10_000)
     stop_event: MPEvent = mp.Event()
@@ -355,7 +366,7 @@ def train_td3(
     for wid in range(num_workers):
         p = mp.Process(
             target=rollout_worker,
-            args=(wid, env_kwargs, cfg.expl_noise, data_queue, param_queue, metric_queue, stop_event),
+            args=(wid, env_kwargs, cfg.expl_noise, data_queue, param_queue, metric_queue, cfg.batch_send_size, stop_event),
         )
         p.daemon = True
         p.start()
@@ -406,17 +417,20 @@ def train_td3(
             break
 
         # 1) 从 data_queue 拉取若干条样本填充 replay
-        #    单步最多拉取与并行 worker 数量同量级的样本，避免队列被迅速塞满导致 worker 阻塞
-        max_fetch = cfg.samples_per_step or (cfg.rollout_workers or 4)
+        #    若未指定 samples_per_step，则尽量清空队列（直到空为止），防止 worker 阻塞
+        max_fetch = cfg.samples_per_step or math.inf
         fetched = 0
         while fetched < max_fetch:
             try:
-                tr = data_queue.get(timeout=0.01)
+                item = data_queue.get_nowait()
             except Exception:
                 break
-            replay.add(tr.s, tr.a, tr.r, tr.s2, tr.done)
-            sample_count += 1
-            fetched += 1
+            # 支持 batch 发送：可能收到 Transition 或 List[Transition]
+            batch_list = item if isinstance(item, list) else [item]
+            for tr in batch_list:
+                replay.add(tr.s, tr.a, tr.r, tr.s2, tr.done)
+            sample_count += len(batch_list)
+            fetched += len(batch_list)
 
         if step % 5000 == 0:
             progress = 100.0 * step / float(cfg.total_steps)
@@ -764,7 +778,7 @@ def _evaluate_combo_worker(args):
 if __name__ == "__main__":
     # 示例配置：把所有重要超参集中在 TD3Config 中，便于一处调参
     cfg1 = TD3Config(
-        device="cuda:0",             # 训练设备（"cpu" / "cuda:0" 等）
+        device="cuda:3",             # 训练设备（"cpu" / "cuda:0" 等）
         gamma=0.99,                  # 折扣因子
         actor_lr=1e-4,               # Actor 学习率
         critic_lr=1e-4,              # Critic 学习率
@@ -789,7 +803,8 @@ if __name__ == "__main__":
         lr_decay_fC_threshold= 0.7,  # eval 合作率高于该阈值时触发 lr 衰减
         lr_decay_multiplier=0.25,    # lr 衰减乘子（乘在当前 lr 上）
         rollout_workers = 24,        # 并行采样进程数（默认自动）
-        samples_per_step = 64  # 每个训练 step 从 data_queue 最多取多少条样本；None 默认等于 rollout_workers 或 4
+        samples_per_step = 150,  # 每个训练 step 从 data_queue 最多取多少条样本；None 默认等于 rollout_workers 或 4
+        batch_send_size = 150  # 每个 worker 累积多少步再打包发送一次，减少 IPC 次数
 
     )
 #继续训练 配置
