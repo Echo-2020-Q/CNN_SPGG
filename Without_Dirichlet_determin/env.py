@@ -298,6 +298,185 @@ class PublicGoodsEnv:
 
         return self.get_state(), planner_reward, done, info
 
+
+class BatchedPublicGoodsEnv:
+    """
+    单进程批量环境：在同一个进程内同时推进 batch_size 个棋盘，避免多进程 IPC 开销。
+    所有 env 共享相同的 episode_length，时间步同步推进。
+    """
+
+    def __init__(
+        self,
+        batch_size: int,
+        L=32,
+        r=1.4,
+        R_decay=0.10,
+        use_cumulative_planner_reward=True,
+        episode_length=500,
+        coop_cost=5.0,
+        initial_R=30,
+    ):
+        self.batch_size = int(batch_size)
+        self.L = L
+        self.r = float(np.asarray(r).item())
+        self.coop_cost = float(coop_cost)
+        self.initial_R = float(initial_R)
+        self.R_decay = float(R_decay)
+        self.use_cumulative_planner_reward = bool(use_cumulative_planner_reward)
+        self.episode_length = int(episode_length)
+
+        self.strategy = np.random.randint(0, 2, size=(self.batch_size, L, L), dtype=np.int8)
+        self.prev_strategy = self.strategy.copy()
+        self.R = np.full((self.batch_size, L, L), fill_value=self.initial_R, dtype=np.float32)
+        self.r_t = np.zeros((self.batch_size, L, L), dtype=np.float32)
+        self.P_center = np.zeros((self.batch_size, L, L), dtype=np.float32)
+        self.planner_cum_reward = np.zeros((self.batch_size,), dtype=np.float32)
+        self.t = 0
+
+    def get_state(self):
+        can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
+        stra_now = can_cooperate.astype(np.float32)
+        stra_prev = (self.prev_strategy == 1).astype(np.float32)
+        P_map = self.P_center.astype(np.float32) / (5.0 * float(self.r) + 1e-8)
+        R_norm = self.R.astype(np.float32) / (self.coop_cost + 1e-8)
+        state = np.stack([stra_now, stra_prev, P_map, R_norm], axis=1)  # (B,4,L,L)
+        return state
+
+    def step(self, pi_field):
+        """
+        pi_field: (B, L, L, 5)
+        返回: state_next (B,4,L,L), reward (B,), done(bool), info(dict汇总均值)
+        """
+        B, L = self.batch_size, self.L
+        new_r = np.zeros_like(self.R, dtype=np.float32)
+        self.P_center.fill(0.0)
+
+        can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
+        mid_can = can_cooperate.astype(np.float32)
+        up_can = np.roll(can_cooperate, shift=1, axis=1).astype(np.float32)
+        down_can = np.roll(can_cooperate, shift=-1, axis=1).astype(np.float32)
+        left_can = np.roll(can_cooperate, shift=1, axis=2).astype(np.float32)
+        right_can = np.roll(can_cooperate, shift=-1, axis=2).astype(np.float32)
+
+        n_c = mid_can + up_can + down_can + left_can + right_can
+        self.P_center[:, :, :] = self.r * n_c
+
+        pi = np.asarray(pi_field, dtype=np.float32)
+        denom = pi.sum(axis=-1, keepdims=True) + 1e-8
+        pi = pi / denom
+
+        P = self.P_center.astype(np.float32)
+        income_mid_center = P * pi[:, :, :, 0]
+        income_up_center = P * pi[:, :, :, 1]
+        income_down_center = P * pi[:, :, :, 2]
+        income_left_center = P * pi[:, :, :, 3]
+        income_right_center = P * pi[:, :, :, 4]
+
+        income_mid_agent = income_mid_center
+        income_up_agent = np.roll(income_up_center, shift=-1, axis=1)
+        income_down_agent = np.roll(income_down_center, shift=1, axis=1)
+        income_left_agent = np.roll(income_left_center, shift=-1, axis=2)
+        income_right_agent = np.roll(income_right_center, shift=1, axis=2)
+
+        income_total = (
+            income_mid_agent
+            + income_up_agent
+            + income_down_agent
+            + income_left_agent
+            + income_right_agent
+        )
+
+        cost_mid_agent = mid_can
+        cost_up_agent = np.roll(up_can, shift=-1, axis=1)
+        cost_down_agent = np.roll(down_can, shift=1, axis=1)
+        cost_left_agent = np.roll(left_can, shift=-1, axis=2)
+        cost_right_agent = np.roll(right_can, shift=1, axis=2)
+
+        cost_total = (
+            cost_mid_agent
+            + cost_up_agent
+            + cost_down_agent
+            + cost_left_agent
+            + cost_right_agent
+        )
+
+        new_r[:, :, :] = income_total - cost_total
+
+        self.r_t = new_r
+        self.R = (1.0 - self.R_decay) * self.R + new_r
+
+        total_P = self.P_center.sum(axis=(1, 2)).astype(np.float32)
+        total_cooperators = ((self.strategy == 1) & (self.R >= self.coop_cost)).sum(axis=(1, 2)).astype(np.float32)
+        net_total = total_P - 5.0 * total_cooperators
+        avg_net = net_total / float(L * L)
+        scale = 5.0 * max(self.r - 1.0, 1e-8)
+        norm_avg_net = avg_net / scale
+
+        if self.use_cumulative_planner_reward:
+            self.planner_cum_reward += norm_avg_net
+            planner_reward = self.planner_cum_reward.copy()
+        else:
+            planner_reward = norm_avg_net
+
+        avg_R_new = self.R.mean()
+        self.prev_strategy = ((self.strategy == 1) & (self.R >= self.coop_cost)).astype(np.int8)
+
+        # Fermi 更新（逐个 env 调用现有逻辑，batch 维不大时开销可接受）
+        for b in range(B):
+            # 保存当前单 env 状态指针，临时替换到 self 上复用现有函数
+            strategy_b = self.strategy[b]
+            R_b = self.R[b]
+            r_t_b = self.r_t[b]
+            prev_strategy_b = self.prev_strategy[b]
+            P_center_b = self.P_center[b]
+
+            # 共享 self 的方法，但对单个 env 进行更新
+            self.strategy = strategy_b
+            self.R = R_b
+            self.r_t = r_t_b
+            self.prev_strategy = prev_strategy_b
+            self.P_center = P_center_b
+            self._update_strategy_fermi(beta=1.0)
+
+            # 写回
+            self.strategy[b] = self.strategy
+            self.R[b] = self.R
+            self.r_t[b] = self.r_t
+            self.prev_strategy[b] = self.prev_strategy
+            self.P_center[b] = self.P_center
+
+        # 恢复批量属性
+        # 重置指针为批量数组
+        self.strategy = self.strategy
+        self.R = self.R
+        self.r_t = self.r_t
+        self.prev_strategy = self.prev_strategy
+        self.P_center = self.P_center
+
+        self.t += 1
+        done = self.t >= self.episode_length
+
+        info = {
+            "avg_R": float(avg_R_new),
+            "avg_r": float(new_r.mean()),
+            "avg_net": float(avg_net.mean()),
+            "f_C": float(((self.strategy == 1) & (self.R >= self.coop_cost)).mean()),
+            "t": self.t,
+            "done": done,
+        }
+
+        return self.get_state(), planner_reward, done, info
+
+    def reset(self):
+        self.strategy = np.random.randint(0, 2, size=(self.batch_size, self.L, self.L), dtype=np.int8)
+        self.prev_strategy = self.strategy.copy()
+        self.R.fill(self.initial_R)
+        self.r_t.fill(0.0)
+        self.P_center.fill(0.0)
+        self.planner_cum_reward.fill(0.0)
+        self.t = 0
+        return self.get_state()
+
     def reset(self):
         # 重置策略、资源、r_t、P_center、prev_strategy 等
         self.strategy = np.random.randint(0, 2, size=(self.L, self.L), dtype=np.int8)
