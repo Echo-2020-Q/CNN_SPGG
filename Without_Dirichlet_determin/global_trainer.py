@@ -595,7 +595,7 @@ if __name__ == "__main__":
     else:
         train_td3(
             L=32,
-            r=1.4,
-            episode_length=500,
+            r=4,
+            episode_length=150,
             cfg=cfg1,
         )

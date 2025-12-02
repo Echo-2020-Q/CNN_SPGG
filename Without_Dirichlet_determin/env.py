@@ -151,6 +151,17 @@ class PublicGoodsEnv:
         new_strategy[self.R < self.coop_cost] = 0
         self.strategy = new_strategy
     # ==============================================================
+    def reset(self):
+        """单环境重置。"""
+        self.strategy = np.random.randint(0, 2, size=(self.L, self.L), dtype=np.int8)
+        self.prev_strategy = self.strategy.copy()
+        self.R.fill(self.initial_R)
+        self.r_t.fill(0.0)
+        self.P_center.fill(0.0)
+        self.planner_cum_reward = 0.0
+        self.t = 0
+        return self.get_state()
+    # ==============================================================
     def step(self, pi_field):
         """
         执行一个时间步（planner已输出π_field）。
@@ -309,12 +320,12 @@ class BatchedPublicGoodsEnv:
         self,
         batch_size: int,
         L=32,
-        r=1.4,
+        r=4,
         R_decay=0.10,
-        use_cumulative_planner_reward=True,
-        episode_length=500,
+        use_cumulative_planner_reward=False,
+        episode_length=150,
         coop_cost=5.0,
-        initial_R=30,
+        initial_R=50,
     ):
         self.batch_size = int(batch_size)
         self.L = L
@@ -421,37 +432,36 @@ class BatchedPublicGoodsEnv:
         avg_R_new = self.R.mean()
         self.prev_strategy = ((self.strategy == 1) & (self.R >= self.coop_cost)).astype(np.int8)
 
-        # Fermi 更新（逐个 env 调用现有逻辑，batch 维不大时开销可接受）
-        for b in range(B):
-            # 保存当前单 env 状态指针，临时替换到 self 上复用现有函数
-            strategy_b = self.strategy[b]
-            R_b = self.R[b]
-            r_t_b = self.r_t[b]
-            prev_strategy_b = self.prev_strategy[b]
-            P_center_b = self.P_center[b]
+        # --------- Fermi 更新（批量向量化） ---------
+        # 随机方向：0=up,1=down,2=left,3=right
+        dir_idx = np.random.randint(0, 4, size=(B, L, L))
+        r_up = np.roll(self.r_t, shift=1, axis=1)
+        r_down = np.roll(self.r_t, shift=-1, axis=1)
+        r_left = np.roll(self.r_t, shift=1, axis=2)
+        r_right = np.roll(self.r_t, shift=-1, axis=2)
 
-            # 共享 self 的方法，但对单个 env 进行更新
-            self.strategy = strategy_b
-            self.R = R_b
-            self.r_t = r_t_b
-            self.prev_strategy = prev_strategy_b
-            self.P_center = P_center_b
-            self._update_strategy_fermi(beta=1.0)
+        s_up = np.roll(self.strategy, shift=1, axis=1)
+        s_down = np.roll(self.strategy, shift=-1, axis=1)
+        s_left = np.roll(self.strategy, shift=1, axis=2)
+        s_right = np.roll(self.strategy, shift=-1, axis=2)
 
-            # 写回
-            self.strategy[b] = self.strategy
-            self.R[b] = self.R
-            self.r_t[b] = self.r_t
-            self.prev_strategy[b] = self.prev_strategy
-            self.P_center[b] = self.P_center
+        neigh_r = np.take_along_axis(
+            np.stack([r_up, r_down, r_left, r_right], axis=-1), dir_idx[..., None], axis=-1
+        ).squeeze(-1)
+        neigh_s = np.take_along_axis(
+            np.stack([s_up, s_down, s_left, s_right], axis=-1), dir_idx[..., None], axis=-1
+        ).squeeze(-1)
 
-        # 恢复批量属性
-        # 重置指针为批量数组
-        self.strategy = self.strategy
-        self.R = self.R
-        self.r_t = self.r_t
-        self.prev_strategy = self.prev_strategy
-        self.P_center = self.P_center
+        diff = neigh_r - self.r_t
+        x = -1.0 * diff
+        x = np.clip(x, -60.0, 60.0)
+        prob = 1.0 / (1.0 + np.exp(x))
+
+        mask = np.random.rand(B, L, L) < prob
+        new_strategy = self.strategy.copy()
+        new_strategy[mask] = neigh_s[mask]
+        new_strategy[self.R < self.coop_cost] = 0
+        self.strategy = new_strategy
 
         self.t += 1
         done = self.t >= self.episode_length
@@ -476,18 +486,3 @@ class BatchedPublicGoodsEnv:
         self.planner_cum_reward.fill(0.0)
         self.t = 0
         return self.get_state()
-
-    def reset(self):
-        # 重置策略、资源、r_t、P_center、prev_strategy 等
-        self.strategy = np.random.randint(0, 2, size=(self.L, self.L), dtype=np.int8)
-        self.prev_strategy = self.strategy.copy()
-        self.R.fill(self.initial_R)
-        self.r_t.fill(0.0)
-        self.P_center.fill(0.0)
-        # 重置 planner 累计奖励（如果有使用累计式奖励）
-        self.planner_cum_reward = 0.0
-        # 重置 episode 步数计数
-        self.t = 0
-        return self.get_state()
-
-
