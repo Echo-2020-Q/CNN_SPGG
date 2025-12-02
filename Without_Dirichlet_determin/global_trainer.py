@@ -36,6 +36,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import MultiplicativeLR
+from torch.utils.tensorboard import SummaryWriter
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
@@ -167,6 +168,7 @@ def rollout_worker(
     expl_noise: float,
     data_queue: MPQueue,
     param_queue: MPQueue,
+    metric_queue: MPQueue,
     stop_event: MPEvent,
 ):
     """
@@ -181,6 +183,9 @@ def rollout_worker(
     actor.load_state_dict(state_dict)
 
     state = env.reset()
+    ep_reward = 0.0
+    ep_fC_sum = 0.0
+    ep_len = 0
     while not stop_event.is_set():
         # 如有新参数，更新本地 actor
         try:
@@ -202,7 +207,19 @@ def rollout_worker(
         )
         data_queue.put(tr)
 
-        state = next_state if not done else env.reset()
+        ep_reward += float(reward)
+        ep_fC_sum += float(info.get("f_C", 0.0))
+        ep_len += 1
+
+        if done:
+            mean_fC = ep_fC_sum / max(1, ep_len)
+            metric_queue.put((worker_id, ep_reward, mean_fC))
+            state = env.reset()
+            ep_reward = 0.0
+            ep_fC_sum = 0.0
+            ep_len = 0
+        else:
+            state = next_state
 
     # 退出前清空一次参数队列，避免主进程阻塞（可选）
     try:
@@ -288,6 +305,7 @@ def train_td3(
     num_workers = cfg.rollout_workers or max(1, min(8, mp.cpu_count()))
     data_queue: MPQueue = mp.Queue(maxsize=10_000)
     param_queue: MPQueue = mp.Queue()
+    metric_queue: MPQueue = mp.Queue(maxsize=10_000)
     stop_event: MPEvent = mp.Event()
 
     def _actor_state_dict_cpu():
@@ -302,7 +320,7 @@ def train_td3(
     for wid in range(num_workers):
         p = mp.Process(
             target=rollout_worker,
-            args=(wid, env_kwargs, cfg.expl_noise, data_queue, param_queue, stop_event),
+            args=(wid, env_kwargs, cfg.expl_noise, data_queue, param_queue, metric_queue, stop_event),
         )
         p.daemon = True
         p.start()
@@ -331,6 +349,7 @@ def train_td3(
         log_path = os.path.join(run_dir, "training_log.csv")
         log_file = open(log_path, "w", newline="")
         log_writer = csv.writer(log_file)
+        tb_writer = SummaryWriter(run_dir)
         log_writer.writerow([
             "type", "step",
             "episode_reward", "mean_episode_fC",
@@ -339,6 +358,7 @@ def train_td3(
         ])
     else:
         os.makedirs(run_dir, exist_ok=True)
+        tb_writer = None
 
     # 采样计数（用于 warmup）
     sample_count = 0
@@ -359,6 +379,34 @@ def train_td3(
             replay.add(tr.s, tr.a, tr.r, tr.s2, tr.done)
             sample_count += 1
             fetched += 1
+
+        if step % 5000 == 0:
+            print(f"[TD3] step={step}, samples={sample_count}, replay_size={len(replay)}")
+
+        # 1.5) 拉取 worker 上报的 episode 统计，写入日志/TensorBoard
+        metrics_fetched = 0
+        while metrics_fetched < 10:
+            try:
+                wid, ep_r, ep_fC = metric_queue.get_nowait()
+            except Exception:
+                break
+            metrics_fetched += 1
+            step_rewards.append(ep_r)
+            step_fCs.append(ep_fC)
+            if log_writer is not None:
+                log_writer.writerow([
+                    "train_episode",
+                    step,
+                    ep_r,
+                    ep_fC,
+                    "",
+                    "",
+                    "",
+                    "",
+                ])
+            if tb_writer is not None:
+                tb_writer.add_scalar("train/episode_reward", ep_r, len(step_rewards))
+                tb_writer.add_scalar("train/mean_fC", ep_fC, len(step_rewards))
 
         # 2) 更新网络（当 replay 中样本数量足够时）
         if len(replay) >= cfg.batch_size and sample_count >= cfg.start_steps:
@@ -507,17 +555,20 @@ def train_td3(
                         f"mean_fC={mean_ef:.4f} >= early_stop_fC_threshold={cfg.early_stop_fC_threshold})"
                     )
                     stop_training = True
-            if log_writer is not None:
-                log_writer.writerow([
-                    "eval",
-                    step,
-                    "",
-                    "",
-                    "",
-                    "",
-                    mean_er,
-                    mean_ef,
-                ])
+        if log_writer is not None:
+            log_writer.writerow([
+                "eval",
+                step,
+                "",
+                "",
+                "",
+                "",
+                mean_er,
+                mean_ef,
+            ])
+            if tb_writer is not None:
+                tb_writer.add_scalar("eval/reward", mean_er, step)
+                tb_writer.add_scalar("eval/mean_fC", mean_ef, step)
 
     # 训练结束后，如需要则保存模型参数
     if cfg.save_models:
@@ -590,6 +641,8 @@ def train_td3(
 
     if log_file is not None:
         log_file.close()
+    if tb_writer is not None:
+        tb_writer.close()
 
     if plt is not None and len(critic_loss_hist) > 0:
         xs = list(range(len(critic_loss_hist)))

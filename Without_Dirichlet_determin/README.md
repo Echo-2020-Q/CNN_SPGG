@@ -115,8 +115,13 @@ TD3 Planner (Deterministic Actor)
 - `TD3Config`：集中管理所有 TD3 相关的超参数（见后文「超参数汇总」）。
 - `ReplayBuffer`：经验回放缓冲区。
 - `select_action`：给定 Actor 和状态，返回带探索噪声的 `pi_field`。
-- `train_td3`：完整的 TD3 训练循环（单环境、单进程）。
+- `train_td3`：完整的 TD3 训练循环（支持多进程采样 + 单 learner）。
 - `evaluate_trained_actor`：加载某个已训练 Actor，在新的 `(L, r, episode_length)` 组合上评估若干 episode。
+- 多进程采样：配置 `rollout_workers` 可启动多个 CPU 进程并行生成样本，主进程用 GPU 训练；每个 worker 内部线程数限制为 1，避免占满所有 CPU。
+- TensorBoard：训练/评估指标会写入 `runs_dir`（默认 checkpoints/<run_id>）：
+  - 训练：`train/episode_reward`、`train/mean_fC`（来自 worker 的 episode 统计）
+  - 评估：`eval/reward`、`eval/mean_fC`
+  运行 `tensorboard --logdir checkpoints` 可实时查看曲线。
 - `__main__`：
   - 构造一个 `TD3Config`；
   - 通过 `EVAL_ONLY` 开关控制是「训练」还是「只评估已有 run」。
@@ -148,14 +153,12 @@ python -m global_trainer
 训练时会：
 
 - 使用 `TD3Config` 中的超参数初始化 env / Actor / Critic / target 网络；
-- 使用经验回放和 TD3 算法与环境交互、更新网络；
-- 每个 episode 结束时打印该 episode 的：
-  - 步数 `episode_len`
-  - 累计奖励 `episode_reward`
-  - 平均合作率 `mean_fC`
+- 使用经验回放和 TD3 算法与环境交互、更新网络；若设置了 `rollout_workers>1`，会启多个 CPU 进程并行采样，主进程用 GPU 训练。
+- 每个 episode 的统计（来自 worker 上报）会写入 `training_log.csv` 与 TensorBoard（train/episode_reward、train/mean_fC）。
 - 每隔 `eval_interval` 步执行一次 eval（若 `eval_interval > 0`）：
   - 在一个全新的 env 上跑 `eval_episodes` 个 episode
   - 打印 eval 平均奖励和平均合作率
+  - 写入 `training_log.csv` 与 TensorBoard（eval/reward、eval/mean_fC）
   - 若 eval reward 优于历史 best 且 `save_best=True`，会额外保存一份 `best_*.pt` 模型。
 
 训练结束后：
