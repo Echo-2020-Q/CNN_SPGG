@@ -382,7 +382,8 @@ def train_td3(
             fetched += 1
 
         if step % 5000 == 0:
-            print(f"[TD3] step={step}, samples={sample_count}, replay_size={len(replay)}")
+            progress = 100.0 * step / float(cfg.total_steps)
+            print(f"[TD3] step={step}/{cfg.total_steps} ({progress:.2f}%), samples={sample_count}, replay_size={len(replay)}")
 
         # 1.5) 拉取 worker 上报的 episode 统计，写入日志/TensorBoard
         metrics_fetched = 0
