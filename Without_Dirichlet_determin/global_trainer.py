@@ -27,10 +27,17 @@ import datetime
 import csv
 import csv
 
+# 限制单进程内部的线程数，避免多进程采样时把所有 CPU 占满
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import MultiplicativeLR
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 try:
     import matplotlib.pyplot as plt
