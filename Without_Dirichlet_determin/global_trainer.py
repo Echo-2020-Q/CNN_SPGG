@@ -31,12 +31,18 @@ except ImportError:
 from env import PublicGoodsEnv, BatchedPublicGoodsEnv
 from planner_net import ActorNet, CriticNet
 
-# 限制单进程内部线程数，避免小网络耗尽 CPU
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
+# 线程数设置：若未显式指定，则按 CPU 核数给一个温和的默认值，方便单进程批量计算走多核
+_user_threads = os.environ.get("OMP_NUM_THREADS")
+if _user_threads is None:
+    _default_threads = max(1, (os.cpu_count() or 8) // 2)
+    os.environ.setdefault("OMP_NUM_THREADS", str(_default_threads))
+    os.environ.setdefault("MKL_NUM_THREADS", str(_default_threads))
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_default_threads))
+    _num_threads = _default_threads
+else:
+    _num_threads = int(_user_threads)
+torch.set_num_threads(_num_threads)
+torch.set_num_interop_threads(max(1, _num_threads // 2))
 
 
 STATE_CHANNELS = 4  # stra_now, stra_prev, P_center_norm, R_norm
@@ -44,31 +50,32 @@ STATE_CHANNELS = 4  # stra_now, stra_prev, P_center_norm, R_norm
 
 @dataclass
 class TD3Config:
-    device: str = "cpu"
-    gamma: float = 0.99
-    actor_lr: float = 1e-4
-    critic_lr: float = 1e-4
-    tau: float = 0.005
-    policy_noise: float = 0.1
-    noise_clip: float = 0.2
-    expl_noise: float = 0.0
-    policy_delay: int = 2
-    batch_size: int = 32
-    replay_size: int = 100_000
-    total_steps: int = 50_000
-    start_steps: int = 1_000
-    eval_interval: int = 5_000
-    eval_episodes: int = 3
-    save_models: bool = True
-    save_dir: str = os.path.join(os.path.dirname(__file__), "checkpoints")
-    load_run_id: Optional[str] = None
-    save_best: bool = True
-    early_stop_patience: int = 0
-    min_steps_for_early_stop: int = 0
-    early_stop_fC_threshold: float = 0.0
-    lr_decay_fC_threshold: float = 0.7
-    lr_decay_multiplier: float = 0.5
-    batch_envs: int = 8  # 单进程向量化环境的并行数量
+    device: str = "cpu"                      # 训练设备（如 "cpu" 或 "cuda:0"）
+    gamma: float = 0.99                      # 折扣因子
+    actor_lr: float = 1e-4                   # Actor 学习率
+    critic_lr: float = 1e-4                  # Critic 学习率
+    tau: float = 0.005                       # target 网络软更新系数
+    policy_noise: float = 0.1                # target policy smoothing 的噪声强度
+    noise_clip: float = 0.2                  # target smoothing 噪声截断范围
+    expl_noise: float = 0.0                  # 行为策略探索噪声（加在 logits 上）
+    policy_delay: int = 2                    # 每多少次 critic 更新，更新一次 actor
+    batch_size: int = 32                     # 每次更新采样的 batch 大小
+    replay_size: int = 100_000               # 经验回放容量
+    total_steps: int = 50_000                # 训练总迭代步数（按 learner 循环计数）
+    start_steps: int = 1_000                 # 前多少样本用纯探索策略（不依赖 actor）
+    eval_interval: int = 5_000               # 评估间隔（learner 步数）
+    eval_episodes: int = 3                   # 每次评估跑多少 episode
+    save_models: bool = True                 # 是否保存模型
+    save_dir: str = os.path.join(os.path.dirname(__file__), "checkpoints")  # 模型保存目录
+    load_run_id: Optional[str] = None        # 若指定，则从该 run_id 目录加载模型
+    save_best: bool = True                   # eval 表现更好时是否保存 best_*.pt
+    early_stop_patience: int = 0             # 若 >0，eval reward 多次未提升则提前停止
+    min_steps_for_early_stop: int = 0        # 早停生效的最小训练步数
+    early_stop_fC_threshold: float = 0.0     # 仅当 eval mean_fC 高于该阈值才允许早停
+    lr_decay_fC_threshold: float = 0.7       # eval 合作率达到阈值时触发 lr 衰减
+    lr_decay_multiplier: float = 0.5         # lr 衰减乘子
+    batch_envs: int = 8                      # 单进程向量化环境的并行数量
+    omp_num_threads: int | None = None       # 若设置，则覆盖线程数（否则用环境变量或默认值）
 
 
 class ReplayBuffer:
@@ -168,7 +175,10 @@ def train_td3(
     )
     if initial_R is not None:
         env_kwargs["initial_R"] = initial_R
+    # 批量环境：单进程内并行 batch_envs 个棋盘
     env = BatchedPublicGoodsEnv(batch_size=cfg.batch_envs, **env_kwargs)
+    # 评估环境复用单实例，避免循环中新建
+    eval_env = PublicGoodsEnv(L=L, r=r, episode_length=episode_length, use_cumulative_planner_reward=False)
 
     actor = ActorNet(in_channels=STATE_CHANNELS).to(device)
     actor_target = ActorNet(in_channels=STATE_CHANNELS).to(device)
@@ -236,8 +246,8 @@ def train_td3(
         os.makedirs(run_dir, exist_ok=True)
         tb_writer = None
 
-    sample_count = 0
-    update_step = 0
+    sample_count = 0        # 已采集的样本总数（按 batch_envs 计）
+    update_step = 0         # 已进行的 critic/actor 更新计数
     state = env.reset()  # (B,4,L,L)
     ep_reward_sum = 0.0
     ep_fC_sum = 0.0
@@ -247,13 +257,16 @@ def train_td3(
         if stop_training:
             break
 
+        # 1) 环境采样：并行推进 batch_envs 个棋盘一步
         pi_field = select_action(actor, state, device, cfg.expl_noise, training=True)  # (B,L,L,5)
         next_state, reward_batch, done, info = env.step(pi_field)
 
+        # 2) 写入 replay（逐 env）
         for b in range(cfg.batch_envs):
             replay.add(state[b], pi_field[b], reward_batch[b], next_state[b], done)
         sample_count += cfg.batch_envs
 
+        # 3) 累积当前 episode 的平均 reward / f_C（按 batch 均值）
         ep_reward_sum += float(np.mean(reward_batch))
         ep_fC_sum += float(info.get("f_C", 0.0))
         ep_len += 1
@@ -285,6 +298,7 @@ def train_td3(
             ep_fC_sum = 0.0
             ep_len = 0
 
+        # 4) Replay 足够且过了 warmup 后才做一次更新
         if len(replay) >= cfg.batch_size and sample_count >= cfg.start_steps:
             s_np, a_np, r_np, s2_np, d_np = replay.sample(cfg.batch_size)
 
@@ -337,6 +351,7 @@ def train_td3(
                 soft_update(critic1_target, critic1, cfg.tau)
                 soft_update(critic2_target, critic2, cfg.tau)
 
+        # 5) 定期评估（单环境复用 eval_env，关闭探索噪声）
         if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
             eval_env = PublicGoodsEnv(
                 L=L, r=r, episode_length=episode_length, use_cumulative_planner_reward=False
@@ -529,31 +544,32 @@ def evaluate_trained_actor(
 if __name__ == "__main__":
     #训练的参数配置
     cfg1 = TD3Config(
-        device="cuda:0",
-        gamma=0.99,
-        actor_lr=1e-4,
-        critic_lr=1e-4,
-        tau=0.005,
-        policy_noise=0.03,
-        noise_clip=0.05,
-        expl_noise=0.005,
-        policy_delay=2,
-        batch_size=1024,
-        replay_size=300_000,
-        total_steps=3_000_000,
-        start_steps=50_000,
-        eval_interval=6_000,
-        eval_episodes=5,
-        save_models=True,
-        save_dir=os.path.join(os.path.dirname(__file__), "checkpoints"),
-        load_run_id=None,
-        save_best=True,
-        early_stop_patience=10,
-        min_steps_for_early_stop=600_000,
-        early_stop_fC_threshold=0.7,
-        lr_decay_fC_threshold=0.7,
-        lr_decay_multiplier=0.25,
-        batch_envs=32,
+        device="cuda:0",                    # 使用的 GPU/CPU
+        gamma=0.99,                         # 折扣因子
+        actor_lr=1e-4,                      # Actor 学习率
+        critic_lr=1e-4,                     # Critic 学习率
+        tau=0.005,                          # target 网络软更新系数
+        policy_noise=0.03,                  # target policy smoothing 噪声
+        noise_clip=0.05,                    # target 噪声截断范围
+        expl_noise=0.005,                   # 行为策略探索噪声
+        policy_delay=2,                     # 每 2 次 critic 更新做 1 次 actor 更新
+        batch_size=1024,                    # 训练时的 batch 大小
+        replay_size=300_000,                # replay buffer 容量
+        total_steps=3_000_000,              # learner 循环总步数
+        start_steps=50_000,                 # warmup 样本阈值
+        eval_interval=6_000,                # 评估间隔
+        eval_episodes=5,                    # 每次评估的 episode 数
+        save_models=True,                   # 是否保存模型
+        save_dir=os.path.join(os.path.dirname(__file__), "checkpoints"),  # 模型保存目录
+        load_run_id=None,                   # 若从已有 run 续训，则填 run_id
+        save_best=True,                     # eval 提升时保存 best_*.pt
+        early_stop_patience=10,             # eval 多次未提升时提前停止
+        min_steps_for_early_stop=600_000,   # 早停生效的最小步数
+        early_stop_fC_threshold=0.7,        # eval 合作率高于该阈值才允许早停
+        lr_decay_fC_threshold=0.7,          # eval 合作率达阈值时触发 lr 衰减
+        lr_decay_multiplier=0.25,           # lr 衰减乘子
+        batch_envs=32,                      # 单进程环境并行数
+        omp_num_threads=24,               # 若指定，则覆盖线程数（否则用环境或默认值）
     )
 
     # 如需仅评估已有模型，配置以下开关和参数

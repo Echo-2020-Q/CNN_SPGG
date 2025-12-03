@@ -92,6 +92,7 @@ class PublicGoodsEnv:
         输出 shape: (4, L, L)
         """
         # 当前轮与上一轮的策略（单通道布尔 -> float32），资源不足 coop_cost 视为 D
+        # 可合作标记：策略为 C 且资源足够
         can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
         stra_now = can_cooperate.astype(np.float32)
         stra_prev = (self.prev_strategy == 1).astype(np.float32)
@@ -372,6 +373,7 @@ class BatchedPublicGoodsEnv:
         n_c = mid_can + up_can + down_can + left_can + right_can
         self.P_center[:, :, :] = self.r * n_c
 
+        # 归一化分配比例，防止数值漂移
         pi = np.asarray(pi_field, dtype=np.float32)
         denom = pi.sum(axis=-1, keepdims=True) + 1e-8
         pi = pi / denom
@@ -411,6 +413,7 @@ class BatchedPublicGoodsEnv:
             + cost_right_agent
         )
 
+        # 每个个体的净收益 = 收入 - 成本
         new_r[:, :, :] = income_total - cost_total
 
         self.r_t = new_r
@@ -478,6 +481,7 @@ class BatchedPublicGoodsEnv:
         return self.get_state(), planner_reward, done, info
 
     def reset(self):
+        """批量重置：重新随机策略/资源，清零计数，返回初始状态。"""
         self.strategy = np.random.randint(0, 2, size=(self.batch_size, self.L, self.L), dtype=np.int8)
         self.prev_strategy = self.strategy.copy()
         self.R.fill(self.initial_R)
