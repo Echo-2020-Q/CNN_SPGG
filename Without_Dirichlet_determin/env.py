@@ -29,7 +29,7 @@ class PublicGoodsEnv:
         use_cumulative_planner_reward=True,
         episode_length=500,
         coop_cost=5.0,
-        initial_R=30,
+        initial_R=50,
     ):
         """
         Args:
@@ -101,10 +101,11 @@ class PublicGoodsEnv:
         # 这样当某个小组 5 个成员全为合作者时，该位置的 P_norm 接近 1，其余情况在 [0,1) 之间。
         P_map = self.P_center.astype(np.float32) / (5.0 * float(self.r) + 1e-8)
 
-        # 累计资源归一化：用“全体满合作时的稳态累计资源”做分母，量级约 5*(r-1)/R_decay
-        # R_{t+1} = (1 - R_decay) R_t + r_i(t)，在 r_i(t)=5*(r-1) 时的稳态解为 5*(r-1)/R_decay
-        denom = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8) + 1e-8
-        R_norm = self.R.astype(np.float32) / denom
+        # 累计资源归一化：用“稳态上限”做分母，防止该通道数值远大于其它通道
+        # 稳态解（满合作）约为 5*(r-1)/R_decay，若衰减极小则用 coop_cost*10 兜底
+        steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
+        scale_R = max(steady_max_R, self.coop_cost * 10.0)
+        R_norm = self.R.astype(np.float32) / (scale_R + 1e-8)
 
         state = np.stack([stra_now, stra_prev, P_map, R_norm], axis=0)
         return state
@@ -326,7 +327,7 @@ class BatchedPublicGoodsEnv:
         use_cumulative_planner_reward=False,
         episode_length=150,
         coop_cost=5.0,
-        initial_R=50,
+        initial_R=30,
     ):
         self.batch_size = int(batch_size)
         self.L = L
@@ -350,7 +351,9 @@ class BatchedPublicGoodsEnv:
         stra_now = can_cooperate.astype(np.float32)
         stra_prev = (self.prev_strategy == 1).astype(np.float32)
         P_map = self.P_center.astype(np.float32) / (5.0 * float(self.r) + 1e-8)
-        R_norm = self.R.astype(np.float32) / (self.coop_cost + 1e-8)
+        steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
+        scale_R = max(steady_max_R, self.coop_cost * 10.0)
+        R_norm = self.R.astype(np.float32) / (scale_R + 1e-8)
         state = np.stack([stra_now, stra_prev, P_map, R_norm], axis=1)  # (B,4,L,L)
         return state
 

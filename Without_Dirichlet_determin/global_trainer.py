@@ -32,17 +32,23 @@ from env import PublicGoodsEnv, BatchedPublicGoodsEnv
 from planner_net import ActorNet, CriticNet
 
 # 线程数设置：若未显式指定，则按 CPU 核数给一个温和的默认值，方便单进程批量计算走多核
+def _set_threads(num_threads: int) -> int:
+    """统一设置 torch / MKL 等线程数。"""
+    num_threads = max(1, int(num_threads))
+    os.environ["OMP_NUM_THREADS"] = str(num_threads)
+    os.environ["MKL_NUM_THREADS"] = str(num_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(num_threads)
+    torch.set_num_threads(num_threads)
+    torch.set_num_interop_threads(max(1, num_threads // 2))
+    return num_threads
+
+
 _user_threads = os.environ.get("OMP_NUM_THREADS")
 if _user_threads is None:
     _default_threads = max(1, (os.cpu_count() or 8) // 2)
-    os.environ.setdefault("OMP_NUM_THREADS", str(_default_threads))
-    os.environ.setdefault("MKL_NUM_THREADS", str(_default_threads))
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_default_threads))
-    _num_threads = _default_threads
+    _num_threads = _set_threads(_default_threads)
 else:
-    _num_threads = int(_user_threads)
-torch.set_num_threads(_num_threads)
-torch.set_num_interop_threads(max(1, _num_threads // 2))
+    _num_threads = _set_threads(_user_threads)
 
 
 STATE_CHANNELS = 4  # stra_now, stra_prev, P_center_norm, R_norm
@@ -76,6 +82,7 @@ class TD3Config:
     lr_decay_multiplier: float = 0.5         # lr 衰减乘子
     batch_envs: int = 8                      # 单进程向量化环境的并行数量
     omp_num_threads: int | None = None       # 若设置，则覆盖线程数（否则用环境变量或默认值）
+    updates_per_step: int | None = None      # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
 
 
 class ReplayBuffer:
@@ -167,6 +174,10 @@ def train_td3(
         cfg = TD3Config()
     device = cfg.device
 
+    # cfg 指定线程数时覆盖默认设置
+    if cfg.omp_num_threads is not None:
+        _set_threads(cfg.omp_num_threads)
+
     env_kwargs = dict(
         L=L,
         r=r,
@@ -178,7 +189,7 @@ def train_td3(
     # 批量环境：单进程内并行 batch_envs 个棋盘
     env = BatchedPublicGoodsEnv(batch_size=cfg.batch_envs, **env_kwargs)
     # 评估环境复用单实例，避免循环中新建
-    eval_env = PublicGoodsEnv(L=L, r=r, episode_length=episode_length, use_cumulative_planner_reward=False)
+    eval_env = PublicGoodsEnv(**env_kwargs)
 
     actor = ActorNet(in_channels=STATE_CHANNELS).to(device)
     actor_target = ActorNet(in_channels=STATE_CHANNELS).to(device)
@@ -258,12 +269,16 @@ def train_td3(
             break
 
         # 1) 环境采样：并行推进 batch_envs 个棋盘一步
-        pi_field = select_action(actor, state, device, cfg.expl_noise, training=True)  # (B,L,L,5)
+        if sample_count < cfg.start_steps:
+            pi_field = np.random.dirichlet(np.ones(5), size=(cfg.batch_envs, L, L)).astype(np.float32)
+        else:
+            pi_field = select_action(actor, state, device, cfg.expl_noise, training=True)  # (B,L,L,5)
         next_state, reward_batch, done, info = env.step(pi_field)
 
         # 2) 写入 replay（逐 env）
+        # 存入 replay：训练目标视角，不考虑时间截断，done 统一按 False 处理
         for b in range(cfg.batch_envs):
-            replay.add(state[b], pi_field[b], reward_batch[b], next_state[b], done)
+            replay.add(state[b], pi_field[b], reward_batch[b], next_state[b], False)
         sample_count += cfg.batch_envs
 
         # 3) 累积当前 episode 的平均 reward / f_C（按 batch 均值）
@@ -300,62 +315,63 @@ def train_td3(
 
         # 4) Replay 足够且过了 warmup 后才做一次更新
         if len(replay) >= cfg.batch_size and sample_count >= cfg.start_steps:
-            s_np, a_np, r_np, s2_np, d_np = replay.sample(cfg.batch_size)
+            # 根据配置决定每个 learner step 做多少次更新，默认与 batch_envs 相同
+            updates_this_step = cfg.updates_per_step or cfg.batch_envs
+            for _ in range(updates_this_step):
+                s_np, a_np, r_np, s2_np, d_np = replay.sample(cfg.batch_size)
 
-            s = torch.from_numpy(s_np).float().to(device)
-            a = torch.from_numpy(a_np).float().to(device)
-            r_batch = torch.from_numpy(r_np).float().to(device)
-            s2 = torch.from_numpy(s2_np).float().to(device)
-            d = torch.from_numpy(d_np).float().to(device)
+                s = torch.from_numpy(s_np).float().to(device)
+                a = torch.from_numpy(a_np).float().to(device)
+                r_batch = torch.from_numpy(r_np).float().to(device)
+                s2 = torch.from_numpy(s2_np).float().to(device)
+                d = torch.from_numpy(d_np).float().to(device)
 
-            a_t = a.permute(0, 3, 1, 2)  # (B,5,L,L)
+                a_t = a.permute(0, 3, 1, 2)  # (B,5,L,L)
 
-            with torch.no_grad():
-                feat2 = actor_target.body(s2)
-                logits2 = actor_target.policy_head(feat2)
-                if cfg.policy_noise > 0.0:
-                    noise = torch.randn_like(logits2) * cfg.policy_noise
-                    noise = torch.clamp(noise, -cfg.noise_clip, cfg.noise_clip)
-                    logits2 = logits2 + noise
-                a2 = torch.softmax(logits2, dim=1)
+                with torch.no_grad():
+                    feat2 = actor_target.body(s2)
+                    logits2 = actor_target.policy_head(feat2)
+                    if cfg.policy_noise > 0.0:
+                        noise = torch.randn_like(logits2) * cfg.policy_noise
+                        noise = torch.clamp(noise, -cfg.noise_clip, cfg.noise_clip)
+                        logits2 = logits2 + noise
+                    a2 = torch.softmax(logits2, dim=1)
 
-                q1_target = critic1_target(s2, a2)
-                q2_target = critic2_target(s2, a2)
-                q_target = torch.min(q1_target, q2_target)
-                target = r_batch + cfg.gamma * (1.0 - d) * q_target
+                    q1_target = critic1_target(s2, a2)
+                    q2_target = critic2_target(s2, a2)
+                    q_target = torch.min(q1_target, q2_target)
+                    target = r_batch + cfg.gamma * (1.0 - d) * q_target
 
-            q1 = critic1(s, a_t)
-            q2 = critic2(s, a_t)
-            critic_loss = ((q1 - target) ** 2).mean() + ((q2 - target) ** 2).mean()
+                q1 = critic1(s, a_t)
+                q2 = critic2(s, a_t)
+                critic_loss = ((q1 - target) ** 2).mean() + ((q2 - target) ** 2).mean()
 
-            critic_opt.zero_grad()
-            critic_loss.backward()
-            nn.utils.clip_grad_norm_(list(critic1.parameters()) + list(critic2.parameters()), 40.0)
-            critic_opt.step()
+                critic_opt.zero_grad()
+                critic_loss.backward()
+                nn.utils.clip_grad_norm_(list(critic1.parameters()) + list(critic2.parameters()), 40.0)
+                critic_opt.step()
 
-            critic_loss_hist.append(float(critic_loss.item()))
+                critic_loss_hist.append(float(critic_loss.item()))
 
-            update_step += 1
-            if update_step % cfg.policy_delay == 0:
-                pi = actor(s)
-                actor_loss = -critic1(s, pi).mean()
+                update_step += 1
+                if update_step % cfg.policy_delay == 0:
+                    pi = actor(s)
+                    actor_loss = -critic1(s, pi).mean()
 
-                actor_opt.zero_grad()
-                actor_loss.backward()
-                nn.utils.clip_grad_norm_(actor.parameters(), 40.0)
-                actor_opt.step()
+                    actor_opt.zero_grad()
+                    actor_loss.backward()
+                    nn.utils.clip_grad_norm_(actor.parameters(), 40.0)
+                    actor_opt.step()
 
-                actor_loss_hist.append(float(actor_loss.item()))
+                    actor_loss_hist.append(float(actor_loss.item()))
 
-                soft_update(actor_target, actor, cfg.tau)
-                soft_update(critic1_target, critic1, cfg.tau)
-                soft_update(critic2_target, critic2, cfg.tau)
+                    soft_update(actor_target, actor, cfg.tau)
+                    soft_update(critic1_target, critic1, cfg.tau)
+                    soft_update(critic2_target, critic2, cfg.tau)
 
         # 5) 定期评估（单环境复用 eval_env，关闭探索噪声）
         if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
-            eval_env = PublicGoodsEnv(
-                L=L, r=r, episode_length=episode_length, use_cumulative_planner_reward=False
-            )
+            eval_env = PublicGoodsEnv(**env_kwargs)
             actor.eval()
             n_eval_ep = max(1, cfg.eval_episodes)
             total_er, total_ef = 0.0, 0.0
@@ -386,17 +402,6 @@ def train_td3(
                 lr_lowered = True
                 print(
                     f"[LR] eval_mean_fC={mean_ef:.4f} > {cfg.lr_decay_fC_threshold}, 降低学习率，"
-                    f"actor_lr={actor_opt.param_groups[0]['lr']:.6g}, "
-                    f"critic_lr={critic_opt.param_groups[0]['lr']:.6g}"
-                )
-            elif lr_lowered and (mean_ef <= cfg.lr_decay_fC_threshold):
-                for pg in actor_opt.param_groups:
-                    pg["lr"] = init_actor_lr
-                for pg in critic_opt.param_groups:
-                    pg["lr"] = init_critic_lr
-                lr_lowered = False
-                print(
-                    f"[LR] eval_mean_fC={mean_ef:.4f} <= {cfg.lr_decay_fC_threshold}, 恢复学习率，"
                     f"actor_lr={actor_opt.param_groups[0]['lr']:.6g}, "
                     f"critic_lr={critic_opt.param_groups[0]['lr']:.6g}"
                 )
@@ -549,9 +554,9 @@ if __name__ == "__main__":
         actor_lr=1e-4,                      # Actor 学习率
         critic_lr=1e-4,                     # Critic 学习率
         tau=0.005,                          # target 网络软更新系数
-        policy_noise=0.03,                  # target policy smoothing 噪声
-        noise_clip=0.05,                    # target 噪声截断范围
-        expl_noise=0.005,                   # 行为策略探索噪声
+        policy_noise=0.2,                   # target policy smoothing 噪声0.03
+        noise_clip=0.5,                     # target 噪声截断范围0.05
+        expl_noise=0.1,                     # 行为策略探索噪声=0.005
         policy_delay=2,                     # 每 2 次 critic 更新做 1 次 actor 更新
         batch_size=1024,                    # 训练时的 batch 大小
         replay_size=300_000,                # replay buffer 容量
@@ -569,7 +574,9 @@ if __name__ == "__main__":
         lr_decay_fC_threshold=0.7,          # eval 合作率达阈值时触发 lr 衰减
         lr_decay_multiplier=0.25,           # lr 衰减乘子
         batch_envs=32,                      # 单进程环境并行数
-        omp_num_threads=24,               # 若指定，则覆盖线程数（否则用环境或默认值）
+        omp_num_threads=24,                 # 若指定，则覆盖线程数（否则用环境或默认值）
+        updates_per_step = None             # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
+
     )
 
     # 如需仅评估已有模型，配置以下开关和参数
