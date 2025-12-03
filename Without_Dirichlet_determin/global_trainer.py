@@ -31,26 +31,6 @@ except ImportError:
 from env import PublicGoodsEnv, BatchedPublicGoodsEnv
 from planner_net import ActorNet, CriticNet
 
-# 线程数设置：若未显式指定，则按 CPU 核数给一个温和的默认值，方便单进程批量计算走多核
-def _set_threads(num_threads: int) -> int:
-    """统一设置 torch / MKL 等线程数。"""
-    num_threads = max(1, int(num_threads))
-    os.environ["OMP_NUM_THREADS"] = str(num_threads)
-    os.environ["MKL_NUM_THREADS"] = str(num_threads)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(num_threads)
-    torch.set_num_threads(num_threads)
-    torch.set_num_interop_threads(max(1, num_threads // 2))
-    return num_threads
-
-
-_user_threads = os.environ.get("OMP_NUM_THREADS")
-if _user_threads is None:
-    _default_threads = max(1, (os.cpu_count() or 8) // 2)
-    _num_threads = _set_threads(_default_threads)
-else:
-    _num_threads = _set_threads(_user_threads)
-
-
 STATE_CHANNELS = 4  # stra_now, stra_prev, P_center_norm, R_norm
 
 
@@ -81,7 +61,6 @@ class TD3Config:
     lr_decay_fC_threshold: float = 0.7       # eval 合作率达到阈值时触发 lr 衰减
     lr_decay_multiplier: float = 0.5         # lr 衰减乘子
     batch_envs: int = 8                      # 单进程向量化环境的并行数量
-    omp_num_threads: int | None = None       # 若设置，则覆盖线程数（否则用环境变量或默认值）
     updates_per_step: int | None = None      # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
 
 
@@ -174,10 +153,6 @@ def train_td3(
         cfg = TD3Config()
     device = cfg.device
 
-    # cfg 指定线程数时覆盖默认设置
-    if cfg.omp_num_threads is not None:
-        _set_threads(cfg.omp_num_threads)
-
     env_kwargs = dict(
         L=L,
         r=r,
@@ -188,7 +163,7 @@ def train_td3(
         env_kwargs["initial_R"] = initial_R
     # 批量环境：单进程内并行 batch_envs 个棋盘
     env = BatchedPublicGoodsEnv(batch_size=cfg.batch_envs, **env_kwargs)
-    # 评估环境复用单实例，避免循环中新建
+    # 评估环境按需新建，确保与训练环境参数一致
     eval_env = PublicGoodsEnv(**env_kwargs)
 
     actor = ActorNet(in_channels=STATE_CHANNELS).to(device)
@@ -518,12 +493,26 @@ def evaluate_trained_actor(
     episode_length: int = 500,
     eval_episodes: int = 5,
     device: str = "cpu",
+    initial_R: float | None = None,
+    R_decay: float = 0.10,
+    coop_cost: float = 5.0,
+    use_cumulative_planner_reward: bool = False,
 ):
     actor = ActorNet(in_channels=STATE_CHANNELS).to(device)
     actor.load_state_dict(torch.load(actor_path, map_location=device))
     actor.eval()
 
-    env = PublicGoodsEnv(L=L, r=r, episode_length=episode_length, use_cumulative_planner_reward=False)
+    env_kwargs = dict(
+        L=L,
+        r=r,
+        episode_length=episode_length,
+        use_cumulative_planner_reward=use_cumulative_planner_reward,
+        R_decay=R_decay,
+        coop_cost=coop_cost,
+    )
+    if initial_R is not None:
+        env_kwargs["initial_R"] = initial_R
+    env = PublicGoodsEnv(**env_kwargs)
     rewards = []
     fcs = []
     for _ in range(eval_episodes):
@@ -559,10 +548,10 @@ if __name__ == "__main__":
         expl_noise=0.1,                     # 行为策略探索噪声=0.005
         policy_delay=2,                     # 每 2 次 critic 更新做 1 次 actor 更新
         batch_size=1024,                    # 训练时的 batch 大小
-        replay_size=300_000,                # replay buffer 容量
-        total_steps=3_000_000,              # learner 循环总步数
-        start_steps=50_000,                 # warmup 样本阈值
-        eval_interval=6_000,                # 评估间隔
+        replay_size=100_000,                # replay buffer 容量
+        total_steps=1_000_000,              # learner 循环总步数
+        start_steps=15_000,                 # warmup 样本阈值
+        eval_interval=5_000,                # 评估间隔
         eval_episodes=5,                    # 每次评估的 episode 数
         save_models=True,                   # 是否保存模型
         save_dir=os.path.join(os.path.dirname(__file__), "checkpoints"),  # 模型保存目录
@@ -574,8 +563,7 @@ if __name__ == "__main__":
         lr_decay_fC_threshold=0.7,          # eval 合作率达阈值时触发 lr 衰减
         lr_decay_multiplier=0.25,           # lr 衰减乘子
         batch_envs=32,                      # 单进程环境并行数
-        omp_num_threads=24,                 # 若指定，则覆盖线程数（否则用环境或默认值）
-        updates_per_step = None             # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
+        updates_per_step=None,              # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
 
     )
 
@@ -587,6 +575,10 @@ if __name__ == "__main__":
     EVAL_EPISODE_LENGTH_LIST = [500]
     EVAL_EPISODES = 5
     EVAL_DEVICE = "cpu"
+    EVAL_INITIAL_R = None      # 若为 None 则用环境默认值；否则覆盖
+    EVAL_R_DECAY = 0.10
+    EVAL_COOP_COST = 5.0
+    EVAL_USE_CUM_REWARD = False
 
     if EVAL_ONLY:
         if not EVAL_RUN_ID:
@@ -606,6 +598,10 @@ if __name__ == "__main__":
                         episode_length=ep_len,
                         eval_episodes=EVAL_EPISODES,
                         device=EVAL_DEVICE,
+                        initial_R=EVAL_INITIAL_R,
+                        R_decay=EVAL_R_DECAY,
+                        coop_cost=EVAL_COOP_COST,
+                        use_cumulative_planner_reward=EVAL_USE_CUM_REWARD,
                     )
                     results.append((L_eval, r_eval, ep_len, EVAL_EPISODES, mean_reward, mean_fC))
 
