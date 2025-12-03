@@ -353,17 +353,17 @@ def train_td3(
             for _ in range(n_eval_ep):
                 s_eval = eval_env.reset()
                 ep_r = 0.0
-                ep_fC_sum = 0.0
+                ep_fC_sum_eval = 0.0
                 ep_len_eval = 0
                 done_eval = False
                 while not done_eval and ep_len_eval < episode_length:
                     pi_eval = select_action(actor, s_eval, device, expl_noise=0.0, training=False)
                     s_eval, r_eval, done_eval, info_eval = eval_env.step(pi_eval)
                     ep_r += r_eval
-                    ep_fC_sum += float(info_eval.get("f_C", 0.0))
+                    ep_fC_sum_eval += float(info_eval.get("f_C", 0.0))
                     ep_len_eval += 1
                 total_er += ep_r
-                total_ef += ep_fC_sum / max(1, ep_len_eval)
+                total_ef += ep_fC_sum_eval / max(1, ep_len_eval)
             actor.train()
 
             mean_er = total_er / n_eval_ep
@@ -547,7 +547,7 @@ if __name__ == "__main__":
         noise_clip=0.5,                     # target 噪声截断范围0.05
         expl_noise=0.1,                     # 行为策略探索噪声=0.005
         policy_delay=2,                     # 每 2 次 critic 更新做 1 次 actor 更新
-        batch_size=1024,                    # 训练时的 batch 大小
+        batch_size=512,                    # 训练时的 batch 大小
         replay_size=100_000,                # replay buffer 容量
         total_steps=1_000_000,              # learner 循环总步数
         start_steps=15_000,                 # warmup 样本阈值
@@ -562,8 +562,8 @@ if __name__ == "__main__":
         early_stop_fC_threshold=0.7,        # eval 合作率高于该阈值才允许早停
         lr_decay_fC_threshold=0.7,          # eval 合作率达阈值时触发 lr 衰减
         lr_decay_multiplier=0.25,           # lr 衰减乘子
-        batch_envs=32,                      # 单进程环境并行数
-        updates_per_step=None,              # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
+        batch_envs=16,                      # 单进程环境并行数
+        updates_per_step=1,              # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
 
     )
 
