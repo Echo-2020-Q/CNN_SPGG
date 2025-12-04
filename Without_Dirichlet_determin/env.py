@@ -188,13 +188,19 @@ class PublicGoodsEnv:
 
         # --------- 1. 组内公共品博弈，累积 r_i(t)（向量化实现） ----------
         # can_cooperate: 当前轮真正能合作的个体（策略为 C 且资源 >= coop_cost）
+        # 为防止投入/收益爆炸，先对资源做一个温和的上限裁剪（基于稳态估计的 20 倍）
+        steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
+        R_cap = max(steady_max_R * 20.0, self.coop_cost * 20.0)
+        self.R = np.clip(self.R, 0.0, R_cap)
         can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
 
         # 按模式计算个体投入
         if self.investment_mode == "fixed_add_proportion":
             invest_base = self.coop_cost
             invest_extra = np.maximum(0.0, self.R - self.coop_cost)
+            invest_extra = np.clip(invest_extra, 0.0, R_cap)  # 防止投入过大
             invest_agent = np.where(can_cooperate, invest_base + self.invest_tau * invest_extra, 0.0).astype(np.float32)
+            invest_agent = np.clip(invest_agent, 0.0, R_cap)
         else:
             invest_agent = can_cooperate.astype(np.float32)  # fixed: 原逻辑，每次参与投入 1
 
@@ -267,6 +273,7 @@ class PublicGoodsEnv:
         self.r_t = new_r
         # 每回合减少当前累计资源的 10%（或 self.R_decay）后再加上本轮收益
         self.R = (1.0 - self.R_decay) * self.R + new_r
+        self.R = np.clip(self.R, 0.0, R_cap)
 
         # --------- 3. 计算 planner 奖励 ----------
         # 这里选择“本回合平均净收益”作为奖励信号：
@@ -379,11 +386,17 @@ class BatchedPublicGoodsEnv:
         new_r = np.zeros_like(self.R, dtype=np.float32)
         self.P_center.fill(0.0)
 
+        steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
+        R_cap = max(steady_max_R * 20.0, self.coop_cost * 20.0)
+        self.R = np.clip(self.R, 0.0, R_cap)
+
         can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
         if self.investment_mode == "fixed_add_proportion":
             invest_base = self.coop_cost
             invest_extra = np.maximum(0.0, self.R - self.coop_cost)
+            invest_extra = np.clip(invest_extra, 0.0, R_cap)
             invest_agent = np.where(can_cooperate, invest_base + self.invest_tau * invest_extra, 0.0).astype(np.float32)
+            invest_agent = np.clip(invest_agent, 0.0, R_cap)
         else:
             invest_agent = can_cooperate.astype(np.float32)
 
@@ -441,6 +454,7 @@ class BatchedPublicGoodsEnv:
 
         self.r_t = new_r
         self.R = (1.0 - self.R_decay) * self.R + new_r
+        self.R = np.clip(self.R, 0.0, R_cap)
 
         total_P = self.P_center.sum(axis=(1, 2)).astype(np.float32)
         total_invest = cost_total.sum(axis=(1, 2)).astype(np.float32)

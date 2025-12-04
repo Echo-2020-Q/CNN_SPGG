@@ -554,7 +554,7 @@ def evaluate_trained_actor(
 if __name__ == "__main__":
     #训练的参数配置
     cfg1 = TD3Config(
-        device="cuda:0",                    # 使用的 GPU/CPU
+        device="cuda:3",                    # 使用的 GPU/CPU
         gamma=0.99,                         # 折扣因子
         actor_lr=1e-4,                      # Actor 学习率
         critic_lr=1e-4,                     # Critic 学习率
@@ -579,7 +579,7 @@ if __name__ == "__main__":
         lr_decay_fC_threshold=0.7,          # eval 合作率达阈值时触发 lr 衰减
         lr_decay_multiplier=0.25,           # lr 衰减乘子
         batch_envs=16,                      # 单进程环境并行数
-        updates_per_step=1,              # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
+        updates_per_step=8,                 # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
         env_R_decay=0.10,                   # 环境累计资源衰减
         env_coop_cost=5.0,                  # 环境合作成本
         env_initial_R=50.0,                 # 环境初始资源
@@ -633,7 +633,7 @@ if __name__ == "__main__":
     else:
         train_td3(
             L=32,
-            r=4,
+            r=3.5,
             episode_length=150,
             cfg=cfg1,
         )
