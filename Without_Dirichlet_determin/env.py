@@ -30,6 +30,8 @@ class PublicGoodsEnv:
         episode_length=500,
         coop_cost=5.0,
         initial_R=50,
+        investment_mode: str = "fixed",
+        investment_tau: float = 0.5,
     ):
         """
         Args:
@@ -47,6 +49,9 @@ class PublicGoodsEnv:
         self.r = float(np.asarray(r).item())
         self.coop_cost = float(coop_cost)
         self.initial_R = float(initial_R)
+        mode = str(investment_mode).strip().lower().replace(" ", "_")
+        self.investment_mode = mode
+        self.invest_tau = float(investment_tau)
 
         # 当前策略：0=D, 1=C
         self.strategy = np.random.randint(0, 2, size=(L, L), dtype=np.int8)
@@ -185,18 +190,24 @@ class PublicGoodsEnv:
         # can_cooperate: 当前轮真正能合作的个体（策略为 C 且资源 >= coop_cost）
         can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
 
+        # 按模式计算个体投入
+        if self.investment_mode == "fixed_add_proportion":
+            invest_base = self.coop_cost
+            invest_extra = np.maximum(0.0, self.R - self.coop_cost)
+            invest_agent = np.where(can_cooperate, invest_base + self.invest_tau * invest_extra, 0.0).astype(np.float32)
+        else:
+            invest_agent = can_cooperate.astype(np.float32)  # fixed: 原逻辑，每次参与投入 1
+
         # 以每个格点为“中心小组”视角，计算该小组中 5 个成员的可合作标记
-        mid_can = can_cooperate.astype(np.float32)                     # (L,L)
-        up_can = np.roll(can_cooperate, shift=1, axis=0).astype(np.float32)    # 上邻居位于 (i-1,j)
-        down_can = np.roll(can_cooperate, shift=-1, axis=0).astype(np.float32) # 下邻居位于 (i+1,j)
-        left_can = np.roll(can_cooperate, shift=1, axis=1).astype(np.float32)  # 左邻居位于 (i,j-1)
-        right_can = np.roll(can_cooperate, shift=-1, axis=1).astype(np.float32)# 右邻居位于 (i,j+1)
+        mid_inv = invest_agent.astype(np.float32)                     # (L,L)
+        up_inv = np.roll(invest_agent, shift=1, axis=0).astype(np.float32)    # 上邻居位于 (i-1,j)
+        down_inv = np.roll(invest_agent, shift=-1, axis=0).astype(np.float32) # 下邻居位于 (i+1,j)
+        left_inv = np.roll(invest_agent, shift=1, axis=1).astype(np.float32)  # 左邻居位于 (i,j-1)
+        right_inv = np.roll(invest_agent, shift=-1, axis=1).astype(np.float32)# 右邻居位于 (i,j+1)
 
-        # 合作者数量 n_c：策略为 C 且资源充足的个体才算合作者
-        n_c = mid_can + up_can + down_can + left_can + right_can      # (L,L)
-
-        # 公共池 P = r * n_c，记录到以 (i,j) 为中心的小组公共池 self.P_center
-        self.P_center[:, :] = r * n_c.astype(np.float32)
+        # 公共池 P = r * (各角色投入之和)，记录到以 (i,j) 为中心的小组公共池 self.P_center
+        n_invest = mid_inv + up_inv + down_inv + left_inv + right_inv      # (L,L)
+        self.P_center[:, :] = r * n_invest.astype(np.float32)
 
         # 当前小组的局部分配比例向量 π_ij (mid, up, down, left, right)
         # 注意：外部虽然应该已经给出概率向量，但这里仍做一次归一化以防数值偏差。
@@ -229,14 +240,12 @@ class PublicGoodsEnv:
             + income_right_agent
         )
 
-        # 成本：只有资源充足且策略为 C 的个体才真正付出成本 1
-        # 以“中心小组”视角，每个 role 的成本标记与上面的 *_can 对应；
-        # 再按与收入相同的方式 roll 回个体坐标并求和。
-        cost_mid_center = mid_can
-        cost_up_center = up_can
-        cost_down_center = down_can
-        cost_left_center = left_can
-        cost_right_center = right_can
+        # 成本：按投入额扣减（与分配映射同样的 roll 逻辑）
+        cost_mid_center = mid_inv
+        cost_up_center = up_inv
+        cost_down_center = down_inv
+        cost_left_center = left_inv
+        cost_right_center = right_inv
 
         cost_mid_agent = cost_mid_center
         cost_up_agent = np.roll(cost_up_center, shift=-1, axis=0)
@@ -252,7 +261,6 @@ class PublicGoodsEnv:
             + cost_right_agent
         )
 
-        # 每个合作者在最多 5 个小组中各付出一次成本 1，正好对应原始实现
         new_r[:, :] = income_total - cost_total
 
         # --------- 2. 更新累计资源 R_i(t+1) = (1 - decay) * R_i(t) + r_i(t) ----------
@@ -269,8 +277,8 @@ class PublicGoodsEnv:
         # 如果 use_cumulative_planner_reward=True，则对 avg_net 做时间累加，
         # 让 planner 在长期尺度上优化制度；否则就只看单步表现。
         total_P = float(self.P_center.sum())
-        total_cooperators = int(((self.strategy == 1) & (self.R >= self.coop_cost)).sum())
-        net_total = total_P - 5.0 * float(total_cooperators)
+        total_invest = float(cost_total.sum())
+        net_total = total_P - total_invest
         avg_net = net_total / float(L * L)
 
         # 进一步按理论最大值 5*(r-1) 做归一化，得到 per-step 归一化奖励
@@ -327,7 +335,9 @@ class BatchedPublicGoodsEnv:
         use_cumulative_planner_reward=False,
         episode_length=150,
         coop_cost=5.0,
-        initial_R=30,
+        initial_R=50,
+        investment_mode: str = "fixed",
+        investment_tau: float = 0.5,
     ):
         self.batch_size = int(batch_size)
         self.L = L
@@ -337,6 +347,9 @@ class BatchedPublicGoodsEnv:
         self.R_decay = float(R_decay)
         self.use_cumulative_planner_reward = bool(use_cumulative_planner_reward)
         self.episode_length = int(episode_length)
+        mode = str(investment_mode).strip().lower().replace(" ", "_")
+        self.investment_mode = mode
+        self.invest_tau = float(investment_tau)
 
         self.strategy = np.random.randint(0, 2, size=(self.batch_size, L, L), dtype=np.int8)
         self.prev_strategy = self.strategy.copy()
@@ -367,14 +380,21 @@ class BatchedPublicGoodsEnv:
         self.P_center.fill(0.0)
 
         can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
-        mid_can = can_cooperate.astype(np.float32)
-        up_can = np.roll(can_cooperate, shift=1, axis=1).astype(np.float32)
-        down_can = np.roll(can_cooperate, shift=-1, axis=1).astype(np.float32)
-        left_can = np.roll(can_cooperate, shift=1, axis=2).astype(np.float32)
-        right_can = np.roll(can_cooperate, shift=-1, axis=2).astype(np.float32)
+        if self.investment_mode == "fixed_add_proportion":
+            invest_base = self.coop_cost
+            invest_extra = np.maximum(0.0, self.R - self.coop_cost)
+            invest_agent = np.where(can_cooperate, invest_base + self.invest_tau * invest_extra, 0.0).astype(np.float32)
+        else:
+            invest_agent = can_cooperate.astype(np.float32)
 
-        n_c = mid_can + up_can + down_can + left_can + right_can
-        self.P_center[:, :, :] = self.r * n_c
+        mid_inv = invest_agent.astype(np.float32)
+        up_inv = np.roll(invest_agent, shift=1, axis=1).astype(np.float32)
+        down_inv = np.roll(invest_agent, shift=-1, axis=1).astype(np.float32)
+        left_inv = np.roll(invest_agent, shift=1, axis=2).astype(np.float32)
+        right_inv = np.roll(invest_agent, shift=-1, axis=2).astype(np.float32)
+
+        n_invest = mid_inv + up_inv + down_inv + left_inv + right_inv
+        self.P_center[:, :, :] = self.r * n_invest
 
         # 归一化分配比例，防止数值漂移
         pi = np.asarray(pi_field, dtype=np.float32)
@@ -402,11 +422,11 @@ class BatchedPublicGoodsEnv:
             + income_right_agent
         )
 
-        cost_mid_agent = mid_can
-        cost_up_agent = np.roll(up_can, shift=-1, axis=1)
-        cost_down_agent = np.roll(down_can, shift=1, axis=1)
-        cost_left_agent = np.roll(left_can, shift=-1, axis=2)
-        cost_right_agent = np.roll(right_can, shift=1, axis=2)
+        cost_mid_agent = mid_inv
+        cost_up_agent = np.roll(up_inv, shift=-1, axis=1)
+        cost_down_agent = np.roll(down_inv, shift=1, axis=1)
+        cost_left_agent = np.roll(left_inv, shift=-1, axis=2)
+        cost_right_agent = np.roll(right_inv, shift=1, axis=2)
 
         cost_total = (
             cost_mid_agent
@@ -423,8 +443,8 @@ class BatchedPublicGoodsEnv:
         self.R = (1.0 - self.R_decay) * self.R + new_r
 
         total_P = self.P_center.sum(axis=(1, 2)).astype(np.float32)
-        total_cooperators = ((self.strategy == 1) & (self.R >= self.coop_cost)).sum(axis=(1, 2)).astype(np.float32)
-        net_total = total_P - 5.0 * total_cooperators
+        total_invest = cost_total.sum(axis=(1, 2)).astype(np.float32)
+        net_total = total_P - total_invest
         avg_net = net_total / float(L * L)
         scale = 5.0 * max(self.r - 1.0, 1e-8)
         norm_avg_net = avg_net / scale

@@ -62,6 +62,12 @@ class TD3Config:
     lr_decay_multiplier: float = 0.5         # lr 衰减乘子
     batch_envs: int = 8                      # 单进程向量化环境的并行数量
     updates_per_step: int | None = None      # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
+    env_R_decay: float = 0.10                # 环境累计资源衰减比例
+    env_coop_cost: float = 5.0               # 环境合作成本
+    env_initial_R: float | None = 30.0       # 环境初始资源；None 则用 env 默认
+    env_use_cumulative_planner_reward: bool = False  # 环境是否累计 planner 奖励
+    env_investment_mode: str = "fixed"       # 投入方式：fixed / fixed_add_proportion
+    env_investment_tau: float = 0.5          # 投入方式为 fixed_add_proportion 时的比例系数 τ
 
 
 class ReplayBuffer:
@@ -157,10 +163,16 @@ def train_td3(
         L=L,
         r=r,
         episode_length=episode_length,
-        use_cumulative_planner_reward=False,
+        use_cumulative_planner_reward=cfg.env_use_cumulative_planner_reward,
+        R_decay=cfg.env_R_decay,
+        coop_cost=cfg.env_coop_cost,
+        investment_mode=cfg.env_investment_mode,
+        investment_tau=cfg.env_investment_tau,
     )
     if initial_R is not None:
         env_kwargs["initial_R"] = initial_R
+    elif cfg.env_initial_R is not None:
+        env_kwargs["initial_R"] = cfg.env_initial_R
     # 批量环境：单进程内并行 batch_envs 个棋盘
     env = BatchedPublicGoodsEnv(batch_size=cfg.batch_envs, **env_kwargs)
     # 评估环境按需新建，确保与训练环境参数一致
@@ -353,17 +365,17 @@ def train_td3(
             for _ in range(n_eval_ep):
                 s_eval = eval_env.reset()
                 ep_r = 0.0
-                ep_fC_sum = 0.0
+                ep_fC_sum_eval = 0.0
                 ep_len_eval = 0
                 done_eval = False
                 while not done_eval and ep_len_eval < episode_length:
                     pi_eval = select_action(actor, s_eval, device, expl_noise=0.0, training=False)
                     s_eval, r_eval, done_eval, info_eval = eval_env.step(pi_eval)
                     ep_r += r_eval
-                    ep_fC_sum += float(info_eval.get("f_C", 0.0))
+                    ep_fC_sum_eval += float(info_eval.get("f_C", 0.0))
                     ep_len_eval += 1
                 total_er += ep_r
-                total_ef += ep_fC_sum / max(1, ep_len_eval)
+                total_ef += ep_fC_sum_eval / max(1, ep_len_eval)
             actor.train()
 
             mean_er = total_er / n_eval_ep
@@ -497,6 +509,8 @@ def evaluate_trained_actor(
     R_decay: float = 0.10,
     coop_cost: float = 5.0,
     use_cumulative_planner_reward: bool = False,
+    investment_mode: str = "fixed",
+    investment_tau: float = 0.5,
 ):
     actor = ActorNet(in_channels=STATE_CHANNELS).to(device)
     actor.load_state_dict(torch.load(actor_path, map_location=device))
@@ -509,6 +523,8 @@ def evaluate_trained_actor(
         use_cumulative_planner_reward=use_cumulative_planner_reward,
         R_decay=R_decay,
         coop_cost=coop_cost,
+        investment_mode=investment_mode,
+        investment_tau=investment_tau,
     )
     if initial_R is not None:
         env_kwargs["initial_R"] = initial_R
@@ -547,24 +563,29 @@ if __name__ == "__main__":
         noise_clip=0.5,                     # target 噪声截断范围0.05
         expl_noise=0.1,                     # 行为策略探索噪声=0.005
         policy_delay=2,                     # 每 2 次 critic 更新做 1 次 actor 更新
-        batch_size=1024,                    # 训练时的 batch 大小
-        replay_size=100_000,                # replay buffer 容量
-        total_steps=1_000_000,              # learner 循环总步数
-        start_steps=15_000,                 # warmup 样本阈值
+        batch_size=512,                    # 训练时的 batch 大小
+        replay_size=50_000,                # replay buffer 容量
+        total_steps=200_000,              # learner 循环总步数
+        start_steps=5_000,                 # warmup 样本阈值
         eval_interval=5_000,                # 评估间隔
         eval_episodes=5,                    # 每次评估的 episode 数
         save_models=True,                   # 是否保存模型
         save_dir=os.path.join(os.path.dirname(__file__), "checkpoints"),  # 模型保存目录
         load_run_id=None,                   # 若从已有 run 续训，则填 run_id
         save_best=True,                     # eval 提升时保存 best_*.pt
-        early_stop_patience=10,             # eval 多次未提升时提前停止
-        min_steps_for_early_stop=600_000,   # 早停生效的最小步数
-        early_stop_fC_threshold=0.7,        # eval 合作率高于该阈值才允许早停
+        early_stop_patience=5,             # eval 多次未提升时提前停止
+        min_steps_for_early_stop=6_000,   # 早停生效的最小步数
+        early_stop_fC_threshold=0.85,        # eval 合作率高于该阈值才允许早停
         lr_decay_fC_threshold=0.7,          # eval 合作率达阈值时触发 lr 衰减
         lr_decay_multiplier=0.25,           # lr 衰减乘子
-        batch_envs=32,                      # 单进程环境并行数
-        updates_per_step=None,              # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
-
+        batch_envs=16,                      # 单进程环境并行数
+        updates_per_step=1,              # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
+        env_R_decay=0.10,                   # 环境累计资源衰减
+        env_coop_cost=5.0,                  # 环境合作成本
+        env_initial_R=50.0,                 # 环境初始资源
+        env_use_cumulative_planner_reward=False,  # 是否累加 planner 奖励
+        env_investment_mode="fixed_add_proportion",        # 投入方式 fixed / fixed_add_proportion
+        env_investment_tau=0.5,             # 投入比例系数 τ（在 fixed_add_proportion 时生效）
     )
 
     # 如需仅评估已有模型，配置以下开关和参数
@@ -575,10 +596,6 @@ if __name__ == "__main__":
     EVAL_EPISODE_LENGTH_LIST = [500]
     EVAL_EPISODES = 5
     EVAL_DEVICE = "cpu"
-    EVAL_INITIAL_R = None      # 若为 None 则用环境默认值；否则覆盖
-    EVAL_R_DECAY = 0.10
-    EVAL_COOP_COST = 5.0
-    EVAL_USE_CUM_REWARD = False
 
     if EVAL_ONLY:
         if not EVAL_RUN_ID:
@@ -598,10 +615,12 @@ if __name__ == "__main__":
                         episode_length=ep_len,
                         eval_episodes=EVAL_EPISODES,
                         device=EVAL_DEVICE,
-                        initial_R=EVAL_INITIAL_R,
-                        R_decay=EVAL_R_DECAY,
-                        coop_cost=EVAL_COOP_COST,
-                        use_cumulative_planner_reward=EVAL_USE_CUM_REWARD,
+                        initial_R=cfg1.env_initial_R,
+                        R_decay=cfg1.env_R_decay,
+                        coop_cost=cfg1.env_coop_cost,
+                        use_cumulative_planner_reward=cfg1.env_use_cumulative_planner_reward,
+                        investment_mode=cfg1.env_investment_mode,
+                        investment_tau=cfg1.env_investment_tau,
                     )
                     results.append((L_eval, r_eval, ep_len, EVAL_EPISODES, mean_reward, mean_fC))
 
