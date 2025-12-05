@@ -68,6 +68,7 @@ class TD3Config:
     env_use_cumulative_planner_reward: bool = False  # 环境是否累计 planner 奖励
     env_investment_mode: str = "fixed"       # 投入方式：fixed / fixed_add_proportion
     env_investment_tau: float = 0.5          # 投入方式为 fixed_add_proportion 时的比例系数 τ
+    env_investment_cmax: float = 5.0         # 投入上界的额外部分 C_max
 
 
 class ReplayBuffer:
@@ -168,6 +169,7 @@ def train_td3(
         coop_cost=cfg.env_coop_cost,
         investment_mode=cfg.env_investment_mode,
         investment_tau=cfg.env_investment_tau,
+        investment_cmax=cfg.env_investment_cmax,
     )
     if initial_R is not None:
         env_kwargs["initial_R"] = initial_R
@@ -511,6 +513,7 @@ def evaluate_trained_actor(
     use_cumulative_planner_reward: bool = False,
     investment_mode: str = "fixed",
     investment_tau: float = 0.5,
+    investment_cmax: float = 5.0,
 ):
     actor = ActorNet(in_channels=STATE_CHANNELS).to(device)
     actor.load_state_dict(torch.load(actor_path, map_location=device))
@@ -525,6 +528,7 @@ def evaluate_trained_actor(
         coop_cost=coop_cost,
         investment_mode=investment_mode,
         investment_tau=investment_tau,
+        investment_cmax=investment_cmax,
     )
     if initial_R is not None:
         env_kwargs["initial_R"] = initial_R
@@ -586,6 +590,7 @@ if __name__ == "__main__":
         env_use_cumulative_planner_reward=False,  # 是否累加 planner 奖励
         env_investment_mode="fixed_add_proportion",        # 投入方式 fixed / fixed_add_proportion
         env_investment_tau=0.5,             # 投入比例系数 τ（在 fixed_add_proportion 时生效）
+        env_investment_cmax=5.0,            # 投入上界的额外部分 C_max
     )
 
     # 如需仅评估已有模型，配置以下开关和参数

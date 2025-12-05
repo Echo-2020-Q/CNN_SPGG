@@ -1,5 +1,0 @@
-type,step,episode_reward,mean_episode_fC,actor_loss,critic_loss,eval_reward,eval_mean_fC
-train_episode,150,3.9807535792933777,0.0232318115234375,,,,
-train_episode,300,4.09307860879926,0.023941446940104166,,,,
-train_episode,450,4.298858646070585,0.02531982421875,,,,
-train_episode,600,3.98436482087709,0.0232177734375,,,,

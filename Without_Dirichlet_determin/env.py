@@ -32,6 +32,7 @@ class PublicGoodsEnv:
         initial_R=50,
         investment_mode: str = "fixed",
         investment_tau: float = 0.5,
+        investment_cmax: float = 5.0,
     ):
         """
         Args:
@@ -52,6 +53,7 @@ class PublicGoodsEnv:
         mode = str(investment_mode).strip().lower().replace(" ", "_")
         self.investment_mode = mode
         self.invest_tau = float(investment_tau)
+        self.invest_cmax = float(investment_cmax)
 
         # 当前策略：0=D, 1=C
         self.strategy = np.random.randint(0, 2, size=(L, L), dtype=np.int8)
@@ -91,8 +93,10 @@ class PublicGoodsEnv:
         构造 CNN 输入状态（提供给 PlannerNet）：
         1) 当前可合作策略：Stra_now（资源足且策略为 C 的为 1，否则 0）
         2) 上一轮策略：Stra_prev（上一轮策略为 C 的为 1，否则 0）
-        3) 当前公共池：P_center（以每个格点为中心小组的 P = r * n_c，经 5*r 归一化）
-        4) 当前累计资源：R_norm = R / (coop_cost + 1e-8)，可合作阈值附近约为 1
+        3) 当前公共池归一化：P_norm
+           - fixed: 分母 5*r
+           - fixed_add_proportion: 分母 r*(coop_cost + C_max)
+        4) 当前累计资源归一化：R_norm，分母为模式对应的稳态上界
 
         输出 shape: (4, L, L)
         """
@@ -102,17 +106,19 @@ class PublicGoodsEnv:
         stra_now = can_cooperate.astype(np.float32)
         stra_prev = (self.prev_strategy == 1).astype(np.float32)
 
-        # 当前公共池（以各点为中心的小组的P），按理论最大值 5*r 做归一化: P_norm = P / (5*r)
-        # 这样当某个小组 5 个成员全为合作者时，该位置的 P_norm 接近 1，其余情况在 [0,1) 之间。
-        P_map = self.P_center.astype(np.float32) / (5.0 * float(self.r) + 1e-8)
+        if self.investment_mode == "fixed_add_proportion":
+            # P_norm 分母：r * (coop_cost + C_max)，对应单个小组的理论最大公共池
+            P_norm = self.P_center.astype(np.float32) / (float(self.r) * (self.coop_cost + self.invest_cmax) + 1e-8)
+            # 稳态上界估计：(1/(1-R_decay)) * (r-1) * (coop_cost + C_max)
+            steady_max_R = (float(self.r) - 1.0) * (self.coop_cost + self.invest_cmax) / max(1e-8, 1.0 - self.R_decay)
+        else:
+            P_norm = self.P_center.astype(np.float32) / (5.0 * float(self.r) + 1e-8)
+            steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
 
-        # 累计资源归一化：用“稳态上限”做分母，防止该通道数值远大于其它通道
-        # 稳态解（满合作）约为 5*(r-1)/R_decay，若衰减极小则用 coop_cost*10 兜底
-        steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
         scale_R = max(steady_max_R, self.coop_cost * 10.0)
         R_norm = self.R.astype(np.float32) / (scale_R + 1e-8)
 
-        state = np.stack([stra_now, stra_prev, P_map, R_norm], axis=0)
+        state = np.stack([stra_now, stra_prev, P_norm, R_norm], axis=0)
         return state
 
     def _update_strategy_fermi(self, beta=1.0):
@@ -188,19 +194,20 @@ class PublicGoodsEnv:
 
         # --------- 1. 组内公共品博弈，累积 r_i(t)（向量化实现） ----------
         # can_cooperate: 当前轮真正能合作的个体（策略为 C 且资源 >= coop_cost）
-        # 为防止投入/收益爆炸，先对资源做一个温和的上限裁剪（基于稳态估计的 20 倍）
-        steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
+        if self.investment_mode == "fixed_add_proportion":
+            steady_max_R = (float(self.r) - 1.0) * (self.coop_cost + self.invest_cmax) / max(1e-8, 1.0 - self.R_decay)
+        else:
+            steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
         R_cap = max(steady_max_R * 20.0, self.coop_cost * 20.0)
         self.R = np.clip(self.R, 0.0, R_cap)
         can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
 
         # 按模式计算个体投入
         if self.investment_mode == "fixed_add_proportion":
-            invest_base = self.coop_cost
+            # R_invest = coop_cost + C_max * tanh(max(0, τ * (R - coop_cost) / C_max))
             invest_extra = np.maximum(0.0, self.R - self.coop_cost)
-            invest_extra = np.clip(invest_extra, 0.0, R_cap)  # 防止投入过大
-            invest_agent = np.where(can_cooperate, invest_base + self.invest_tau * invest_extra, 0.0).astype(np.float32)
-            invest_agent = np.clip(invest_agent, 0.0, R_cap)
+            invest_agent = self.coop_cost + self.invest_cmax * np.tanh((self.invest_tau * invest_extra) / max(1e-8, self.invest_cmax))
+            invest_agent = np.where(can_cooperate, invest_agent, 0.0).astype(np.float32)
         else:
             invest_agent = can_cooperate.astype(np.float32)  # fixed: 原逻辑，每次参与投入 1
 
@@ -277,20 +284,19 @@ class PublicGoodsEnv:
 
         # --------- 3. 计算 planner 奖励 ----------
         # 这里选择“本回合平均净收益”作为奖励信号：
-        #   total_P          = 本回合所有小组公共池之和   = r * 总合作者出资次数
-        #   5 * total_coop   = 系统中所有合作者的总成本（每个合作者参与 5 个小组）
-        #   net_total        = total_P - 5 * total_cooperators
-        #   avg_net          = net_total / (L^2)
-        # 如果 use_cumulative_planner_reward=True，则对 avg_net 做时间累加，
-        # 让 planner 在长期尺度上优化制度；否则就只看单步表现。
+        # 如果 use_cumulative_planner_reward=True，则对 avg_net 做时间累加；
+        # 否则只看单步表现。归一化分母随投入模式变化：
+        # - fixed:     scale=5*(r-1)
+        # - add_prop:  scale=(r-1)*(coop_cost+C_max)
         total_P = float(self.P_center.sum())
         total_invest = float(cost_total.sum())
         net_total = total_P - total_invest
         avg_net = net_total / float(L * L)
 
-        # 进一步按理论最大值 5*(r-1) 做归一化，得到 per-step 归一化奖励
-        # 理解为：当前平均净收益 / 理论上每个体最多能获得的净收益（大致量级）
-        scale = 5.0 * max(self.r - 1.0, 1e-8)
+        if self.investment_mode == "fixed_add_proportion":
+            scale = max((self.r - 1.0) * (self.coop_cost + self.invest_cmax), 1e-8)
+        else:
+            scale = 5.0 * max(self.r - 1.0, 1e-8)
         norm_avg_net = avg_net / scale
 
         # 根据开关决定是否累加 planner reward（在 TD3 设置中通常关闭累加）但是这是是默认开启累加的
@@ -345,6 +351,7 @@ class BatchedPublicGoodsEnv:
         initial_R=50,
         investment_mode: str = "fixed",
         investment_tau: float = 0.5,
+        investment_cmax: float = 5.0,
     ):
         self.batch_size = int(batch_size)
         self.L = L
@@ -357,6 +364,7 @@ class BatchedPublicGoodsEnv:
         mode = str(investment_mode).strip().lower().replace(" ", "_")
         self.investment_mode = mode
         self.invest_tau = float(investment_tau)
+        self.invest_cmax = float(investment_cmax)
 
         self.strategy = np.random.randint(0, 2, size=(self.batch_size, L, L), dtype=np.int8)
         self.prev_strategy = self.strategy.copy()
@@ -370,11 +378,15 @@ class BatchedPublicGoodsEnv:
         can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
         stra_now = can_cooperate.astype(np.float32)
         stra_prev = (self.prev_strategy == 1).astype(np.float32)
-        P_map = self.P_center.astype(np.float32) / (5.0 * float(self.r) + 1e-8)
-        steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
+        if self.investment_mode == "fixed_add_proportion":
+            P_norm = self.P_center.astype(np.float32) / (float(self.r) * (self.coop_cost + self.invest_cmax) + 1e-8)
+            steady_max_R = (float(self.r) - 1.0) * (self.coop_cost + self.invest_cmax) / max(1e-8, 1.0 - self.R_decay)
+        else:
+            P_norm = self.P_center.astype(np.float32) / (5.0 * float(self.r) + 1e-8)
+            steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
         scale_R = max(steady_max_R, self.coop_cost * 10.0)
         R_norm = self.R.astype(np.float32) / (scale_R + 1e-8)
-        state = np.stack([stra_now, stra_prev, P_map, R_norm], axis=1)  # (B,4,L,L)
+        state = np.stack([stra_now, stra_prev, P_norm, R_norm], axis=1)  # (B,4,L,L)
         return state
 
     def step(self, pi_field):
@@ -386,17 +398,18 @@ class BatchedPublicGoodsEnv:
         new_r = np.zeros_like(self.R, dtype=np.float32)
         self.P_center.fill(0.0)
 
-        steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
+        if self.investment_mode == "fixed_add_proportion":
+            steady_max_R = (float(self.r) - 1.0) * (self.coop_cost + self.invest_cmax) / max(1e-8, 1.0 - self.R_decay)
+        else:
+            steady_max_R = 5.0 * max(float(self.r) - 1.0, 0.0) / (self.R_decay + 1e-8)
         R_cap = max(steady_max_R * 20.0, self.coop_cost * 20.0)
         self.R = np.clip(self.R, 0.0, R_cap)
 
         can_cooperate = (self.strategy == 1) & (self.R >= self.coop_cost)
         if self.investment_mode == "fixed_add_proportion":
-            invest_base = self.coop_cost
             invest_extra = np.maximum(0.0, self.R - self.coop_cost)
-            invest_extra = np.clip(invest_extra, 0.0, R_cap)
-            invest_agent = np.where(can_cooperate, invest_base + self.invest_tau * invest_extra, 0.0).astype(np.float32)
-            invest_agent = np.clip(invest_agent, 0.0, R_cap)
+            invest_agent = self.coop_cost + self.invest_cmax * np.tanh((self.invest_tau * invest_extra) / max(1e-8, self.invest_cmax))
+            invest_agent = np.where(can_cooperate, invest_agent, 0.0).astype(np.float32)
         else:
             invest_agent = can_cooperate.astype(np.float32)
 
@@ -460,7 +473,10 @@ class BatchedPublicGoodsEnv:
         total_invest = cost_total.sum(axis=(1, 2)).astype(np.float32)
         net_total = total_P - total_invest
         avg_net = net_total / float(L * L)
-        scale = 5.0 * max(self.r - 1.0, 1e-8)
+        if self.investment_mode == "fixed_add_proportion":
+            scale = max((self.r - 1.0) * (self.coop_cost + self.invest_cmax), 1e-8)
+        else:
+            scale = 5.0 * max(self.r - 1.0, 1e-8)
         norm_avg_net = avg_net / scale
 
         if self.use_cumulative_planner_reward:
