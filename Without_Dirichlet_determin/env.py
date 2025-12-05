@@ -294,7 +294,8 @@ class PublicGoodsEnv:
         avg_net = net_total / float(L * L)
 
         if self.investment_mode == "fixed_add_proportion":
-            scale = max((self.r - 1.0) * (self.coop_cost + self.invest_cmax), 1e-8)
+            # 理论上个体可从 5 个小组获取收益，按每组投入上界估计：5*(r-1)*(coop_cost+C_max)
+            scale = max(5.0 * (self.r - 1.0) * (self.coop_cost + self.invest_cmax), 1e-8)
         else:
             scale = 5.0 * max(self.r - 1.0, 1e-8)
         norm_avg_net = avg_net / scale
@@ -474,7 +475,8 @@ class BatchedPublicGoodsEnv:
         net_total = total_P - total_invest
         avg_net = net_total / float(L * L)
         if self.investment_mode == "fixed_add_proportion":
-            scale = max((self.r - 1.0) * (self.coop_cost + self.invest_cmax), 1e-8)
+            # 个体可从 5 个小组获益，按上界估计 scale=5*(r-1)*(coop_cost+C_max)
+            scale = max(5.0 * (self.r - 1.0) * (self.coop_cost + self.invest_cmax), 1e-8)
         else:
             scale = 5.0 * max(self.r - 1.0, 1e-8)
         norm_avg_net = avg_net / scale
