@@ -61,14 +61,15 @@ class TD3Config:
     lr_decay_fC_threshold: float = 0.7       # eval 合作率达到阈值时触发 lr 衰减
     lr_decay_multiplier: float = 0.5         # lr 衰减乘子
     batch_envs: int = 8                      # 单进程向量化环境的并行数量
-    updates_per_step: int | None = None      # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
+    updates_per_step: Optional[int] = None      # 每个 learner step 做多少次更新，None 时默认等于 batch_envs
     env_R_decay: float = 0.10                # 环境累计资源衰减比例
     env_coop_cost: float = 5.0               # 环境合作成本
-    env_initial_R: float | None = 30.0       # 环境初始资源；None 则用 env 默认
+    env_initial_R: Optional[float] = 30.0       # 环境初始资源；None 则用 env 默认
     env_use_cumulative_planner_reward: bool = False  # 环境是否累计 planner 奖励
     env_investment_mode: str = "fixed"       # 投入方式：fixed / fixed_add_proportion
     env_investment_tau: float = 0.5          # 投入方式为 fixed_add_proportion 时的比例系数 τ
     env_investment_cmax: float = 45.0         # 投入上界的额外部分 C_max
+    env_P_max: float = 50.0                  # 公共池上限（用于 fixed_add_proportion_poolmax）
 
 
 class ReplayBuffer:
@@ -153,8 +154,8 @@ def train_td3(
     L: int = 32,
     r: float = 1.4,
     episode_length: int = 500,
-    cfg: TD3Config | None = None,
-    initial_R: float | None = None,
+    cfg: Optional[TD3Config] = None,
+    initial_R: Optional[float] = None,
 ):
     if cfg is None:
         cfg = TD3Config()
@@ -170,6 +171,7 @@ def train_td3(
         investment_mode=cfg.env_investment_mode,
         investment_tau=cfg.env_investment_tau,
         investment_cmax=cfg.env_investment_cmax,
+        P_max=cfg.env_P_max,
     )
     if initial_R is not None:
         env_kwargs["initial_R"] = initial_R
@@ -507,13 +509,14 @@ def evaluate_trained_actor(
     episode_length: int = 500,
     eval_episodes: int = 5,
     device: str = "cpu",
-    initial_R: float | None = None,
+    initial_R: Optional[float] = None,
     R_decay: float = 0.10,
     coop_cost: float = 5.0,
     use_cumulative_planner_reward: bool = False,
     investment_mode: str = "fixed",
     investment_tau: float = 0.5,
     investment_cmax: float = 5.0,
+    P_max: float = 50.0,
 ):
     actor = ActorNet(in_channels=STATE_CHANNELS).to(device)
     actor.load_state_dict(torch.load(actor_path, map_location=device))
@@ -529,6 +532,7 @@ def evaluate_trained_actor(
         investment_mode=investment_mode,
         investment_tau=investment_tau,
         investment_cmax=investment_cmax,
+        P_max=P_max,
     )
     if initial_R is not None:
         env_kwargs["initial_R"] = initial_R
@@ -588,9 +592,10 @@ if __name__ == "__main__":
         env_coop_cost=5.0,                  # 环境合作成本
         env_initial_R=50.0,                 # 环境初始资源
         env_use_cumulative_planner_reward=False,  # 是否累加 planner 奖励
-        env_investment_mode="fixed_add_proportion",        # 投入方式 fixed / fixed_add_proportion
+        env_investment_mode="fixed_add_proportion",        # 投入方式 fixed / fixed_add_proportion / fixed_add_proportion_poolmax
         env_investment_tau=0.5,             # 投入比例系数 τ（在 fixed_add_proportion 时生效）
         env_investment_cmax=45.0,            # 投入上界的额外部分 C_max
+        env_P_max=50.0,                      # 公共池上限（poolmax 模式）
     )
 
     # 如需仅评估已有模型，配置以下开关和参数
@@ -626,6 +631,8 @@ if __name__ == "__main__":
                         use_cumulative_planner_reward=cfg1.env_use_cumulative_planner_reward,
                         investment_mode=cfg1.env_investment_mode,
                         investment_tau=cfg1.env_investment_tau,
+                        investment_cmax=cfg1.env_investment_cmax,
+                        P_max=cfg1.env_P_max,
                     )
                     results.append((L_eval, r_eval, ep_len, EVAL_EPISODES, mean_reward, mean_fC))
 
