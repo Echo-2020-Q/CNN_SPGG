@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import datetime
+import glob
 from typing import List, Tuple
 
 import matplotlib
@@ -37,9 +38,9 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 # 便于直接在 main 中修改的默认参数（可被命令行覆盖）
 # actor_path: 训练好的模型路径；其余均为环境和采样/输出控制参数。
 DEFAULT_CFG = {
-    "actor_path": "checkpoints/20251119_230050第一版T3D较好效果/actor.pt",         # 模型路径（必填），示例 checkpoints/<run_id>/actor.pt
-    "L": 40,                  # 棋盘边长
-    "r": 4.0,                 # 公共物品放大因子
+    "actor_path": "checkpoints/20251205_214027_年前好的一版/best_actor.pt",         # 模型路径（必填），示例 checkpoints/<run_id>/actor.pt
+    "L": 32,                  # 棋盘边长
+    "r": 3.0,                 # 公共物品放大因子
     "episode_length": 150,    # rollout 时每个 episode 的最大步数
     "num_states": 150,          # 需要可视化的状态数量
     "max_steps": 300,         # 最多滚动多少步来采集 num_states
@@ -81,9 +82,48 @@ def _clean_heatmap(arr: np.ndarray) -> np.ndarray:
 def load_actor(actor_path: str, device: str) -> ActorNet:
     """加载已训练的 actor.pt，切到 eval 模式。"""
     actor = ActorNet(in_channels=4).to(device)
-    actor.load_state_dict(torch.load(actor_path, map_location=device))
+    try:
+        state_dict = torch.load(actor_path, map_location=device, weights_only=True)
+    except TypeError:
+        state_dict = torch.load(actor_path, map_location=device)
+    actor.load_state_dict(state_dict)
     actor.eval()
     return actor
+
+
+def _resolve_path(path: str) -> str:
+    """
+    Resolve a possibly-relative path robustly:
+    - keep absolute paths as-is;
+    - otherwise try (1) current working directory, then (2) this script's directory.
+
+    This helps when running `python Without_Dirichlet_determin/viz_actor.py` from the repo root.
+    """
+    if os.path.isabs(path):
+        return path
+    if os.path.exists(path):
+        return path
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(base_dir, path)
+    if os.path.exists(candidate):
+        return candidate
+    return path
+
+
+def _suggest_actor_paths(max_items: int = 12) -> List[str]:
+    """Return a short list of existing checkpoint actor paths for error messages."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    patterns = [
+        os.path.join(base_dir, "checkpoints", "*", "best_actor.pt"),
+        os.path.join(base_dir, "checkpoints", "*", "actor.pt"),
+    ]
+    out: List[str] = []
+    for pat in patterns:
+        for p in sorted(glob.glob(pat)):
+            out.append(p)
+            if len(out) >= max_items:
+                return out
+    return out
 
 
 def select_action(actor: ActorNet, state: np.ndarray, device: str) -> np.ndarray:
@@ -360,7 +400,10 @@ def compute_grad_cam(
     def fwd_hook(module, inp, output):
         feature_ref["tensor"] = output
 
-    target_layer = actor.body.net[-2]  # 最后一层 Conv
+    # 这里选取 actor.body 的输出特征图作为 Grad-CAM 的特征图来源。
+    # 早期版本 ConvBody 可能是 nn.Sequential（带 .net），现在的实现是显式 conv1/conv2/conv3，
+    # 因此直接 hook 到 actor.body 更稳健。
+    target_layer = actor.body
     handle_fwd = target_layer.register_forward_hook(fwd_hook)
 
     s_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)
@@ -416,7 +459,8 @@ def compute_grad_cam_all(
     def fwd_hook(module, inp, output):
         feature_ref["tensor"] = output
 
-    target_layer = actor.body.net[-2]
+    # 同 compute_grad_cam：直接 hook 到 actor.body，避免依赖 ConvBody 的内部实现细节。
+    target_layer = actor.body
     handle_fwd = target_layer.register_forward_hook(fwd_hook)
 
     s_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)
@@ -467,13 +511,14 @@ def plot_saliency(
 ):
     """
     将敏感度热力图与输入状态并排展示，结构与 Grad-CAM 保持一致：
-    - 本轮可合作策略 / 上一轮策略 / P_center_norm / 全局或单点敏感度。
+    - 本轮可合作策略 / 上一轮策略 / P_center_norm / R_norm / 全局或单点敏感度。
     """
     stra_now = state[0]
     stra_prev = state[1]
     p_center = state[2]
+    r_norm = state[3]
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
     fig.suptitle(f"{title} | t={t}, L={L}, r={r}", fontsize=12)
 
     im0 = axes[0].imshow(stra_now, vmin=0, vmax=1, cmap="Greens")
@@ -488,10 +533,14 @@ def plot_saliency(
     axes[2].set_title("P_center_norm")
     fig.colorbar(im1, ax=axes[2], fraction=0.046, pad=0.04)
 
+    im_r = axes[3].imshow(r_norm, cmap="Purples")
+    axes[3].set_title("R_norm")
+    fig.colorbar(im_r, ax=axes[3], fraction=0.046, pad=0.04)
+
     saliency_clean = _clean_heatmap(saliency)
-    im2 = axes[3].imshow(saliency_clean, cmap="magma", vmin=0.0, vmax=1.0)
-    axes[3].set_title("Saliency (敏感度)")
-    fig.colorbar(im2, ax=axes[3], fraction=0.046, pad=0.04)
+    im2 = axes[4].imshow(saliency_clean, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[4].set_title("Saliency (敏感度)")
+    fig.colorbar(im2, ax=axes[4], fraction=0.046, pad=0.04)
 
     for ax in axes.ravel():
         ax.set_xticks([])
@@ -513,37 +562,39 @@ def plot_saliency_channels(
 ):
     """
     通道级敏感度可视化：
-    - 通道 0: 上一轮策略 Stra_prev
-    - 通道 1: 当前可合作策略 Stra_now
+    - 通道 0: 当前可合作策略 Stra_now
+    - 通道 1: 上一轮策略 Stra_prev
     - 通道 2: 归一化公共池 P_center_norm
+    - 通道 3: 归一化累计资源 R_norm
     每个子图展示对应通道的敏感度热力图。
     """
-    stra_prev = state[1]
     stra_now = state[0]
+    stra_prev = state[1]
     p_center = state[2]
+    r_norm = state[3]
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+    fig, axes = plt.subplots(2, 4, figsize=(20, 8))
     fig.suptitle(f"{title} (per-channel) | t={t}, L={L}, r={r}", fontsize=12)
 
-    # 上一轮策略 + 敏感度
-    im_prev = axes[0, 0].imshow(stra_prev, vmin=0, vmax=1, cmap="Greens")
-    axes[0, 0].set_title("Stra_prev (上一轮策略)")
-    fig.colorbar(im_prev, ax=axes[0, 0], fraction=0.046, pad=0.04)
-
-    sal_prev_clean = _clean_heatmap(saliency_ch[0])
-    im_prev_sal = axes[1, 0].imshow(sal_prev_clean, cmap="magma", vmin=0.0, vmax=1.0)
-    axes[1, 0].set_title("Saliency: 通道1 (上一轮)")
-    fig.colorbar(im_prev_sal, ax=axes[1, 0], fraction=0.046, pad=0.04)
-
     # 当前可合作策略 + 敏感度
-    im_now = axes[0, 1].imshow(stra_now, vmin=0, vmax=1, cmap="Greens")
-    axes[0, 1].set_title("Stra_now (本轮可合作)")
-    fig.colorbar(im_now, ax=axes[0, 1], fraction=0.046, pad=0.04)
+    im_now = axes[0, 0].imshow(stra_now, vmin=0, vmax=1, cmap="Greens")
+    axes[0, 0].set_title("Stra_now (本轮可合作)")
+    fig.colorbar(im_now, ax=axes[0, 0], fraction=0.046, pad=0.04)
 
-    sal_now_clean = _clean_heatmap(saliency_ch[1])
-    im_now_sal = axes[1, 1].imshow(sal_now_clean, cmap="magma", vmin=0.0, vmax=1.0)
-    axes[1, 1].set_title("Saliency: 通道2 (本轮)")
-    fig.colorbar(im_now_sal, ax=axes[1, 1], fraction=0.046, pad=0.04)
+    sal_now_clean = _clean_heatmap(saliency_ch[0])
+    im_now_sal = axes[1, 0].imshow(sal_now_clean, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[1, 0].set_title("Saliency: 通道1 (本轮)")
+    fig.colorbar(im_now_sal, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+    # 上一轮策略 + 敏感度
+    im_prev = axes[0, 1].imshow(stra_prev, vmin=0, vmax=1, cmap="Greens")
+    axes[0, 1].set_title("Stra_prev (上一轮策略)")
+    fig.colorbar(im_prev, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+    sal_prev_clean = _clean_heatmap(saliency_ch[1])
+    im_prev_sal = axes[1, 1].imshow(sal_prev_clean, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[1, 1].set_title("Saliency: 通道2 (上一轮)")
+    fig.colorbar(im_prev_sal, ax=axes[1, 1], fraction=0.046, pad=0.04)
 
     # 公共池 + 敏感度
     im_p = axes[0, 2].imshow(p_center, cmap="Blues")
@@ -552,8 +603,18 @@ def plot_saliency_channels(
 
     sal_p_clean = _clean_heatmap(saliency_ch[2])
     im_p_sal = axes[1, 2].imshow(sal_p_clean, cmap="magma", vmin=0.0, vmax=1.0)
-    axes[1, 2].set_title("Saliency: 通道3 (资源)")
+    axes[1, 2].set_title("Saliency: 通道3 (公共池)")
     fig.colorbar(im_p_sal, ax=axes[1, 2], fraction=0.046, pad=0.04)
+
+    # 资源 + 敏感度
+    im_r = axes[0, 3].imshow(r_norm, cmap="Purples")
+    axes[0, 3].set_title("R_norm")
+    fig.colorbar(im_r, ax=axes[0, 3], fraction=0.046, pad=0.04)
+
+    sal_r_clean = _clean_heatmap(saliency_ch[3])
+    im_r_sal = axes[1, 3].imshow(sal_r_clean, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[1, 3].set_title("Saliency: 通道4 (资源)")
+    fig.colorbar(im_r_sal, ax=axes[1, 3], fraction=0.046, pad=0.04)
 
     for ax in axes.ravel():
         ax.set_xticks([])
@@ -577,17 +638,17 @@ def compute_ig_channels(
     - 从 baseline 到 state 做 m_steps 次线性插值；
     - 每一步以全局动作输出 pi.mean() 为目标标量；
     - 累积梯度近似积分，得到每个通道的 IG；
-    - 在空间上求和，得到 3 个通道的整体贡献，并做绝对值归一化到和为 1。
+    - 在空间上求和，得到各通道的整体贡献，并做绝对值归一化到和为 1。
 
     返回:
-        contrib (3,)  对应 [上一轮策略, 当前策略, 公共池] 的相对贡献。
+        contrib (C,)  对应当前 state 各通道的相对贡献。
     """
     actor.eval()
 
     state_np = target_state.astype(np.float32)
     baseline_np = baseline_state.astype(np.float32)
 
-    state_t = torch.from_numpy(state_np).unsqueeze(0).to(device)    # (1,3,L,L)
+    state_t = torch.from_numpy(state_np).unsqueeze(0).to(device)    # (1,C,L,L)
     baseline_t = torch.from_numpy(baseline_np).unsqueeze(0).to(device)
 
     total_grad = torch.zeros_like(state_t)
@@ -605,11 +666,12 @@ def compute_ig_channels(
         target.backward()
         total_grad += x.grad
 
-    avg_grad = total_grad / float(m_steps)  # (1,3,L,L)
-    ig = (state_t - baseline_t) * avg_grad  # (1,3,L,L)
-    ig_np = ig.detach().cpu().numpy()[0]    # (3,L,L)
+    avg_grad = total_grad / float(m_steps)  # (1,C,L,L)
+    ig = (state_t - baseline_t) * avg_grad  # (1,C,L,L)
+    ig_np = ig.detach().cpu().numpy()[0]    # (C,L,L)
 
-    contrib = ig_np.reshape(3, -1).sum(axis=1)  # 每个通道在空间上的总贡献
+    num_channels = ig_np.shape[0]
+    contrib = ig_np.reshape(num_channels, -1).sum(axis=1)  # 每个通道在空间上的总贡献
     contrib_abs = np.abs(contrib)
     if contrib_abs.sum() > 0:
         contrib_norm = contrib_abs / (contrib_abs.sum() + 1e-8)
@@ -628,14 +690,22 @@ def plot_ig_bar(
 ):
     """
     绘制通道贡献柱状图：
-    - x 轴：三个通道（上一轮 / 当前 / 公共池）
+    - x 轴：状态各通道
     - y 轴：Integrated Gradients 归一化贡献（0~1，绝对值归一）
     """
-    labels = ["通道1(上一轮)", "通道2(本轮)", "通道3(资源)"]
+    if len(contrib) == 4:
+        labels = ["Stra_now", "Stra_prev", "P_norm", "R_norm"]
+        colors = ["#4e79a7", "#f28e2c", "#e15759", "#76b7b2"]
+    elif len(contrib) == 3:
+        labels = ["Stra_now", "Stra_prev", "P_norm"]
+        colors = ["#4e79a7", "#f28e2c", "#e15759"]
+    else:
+        labels = [f"ch{i}" for i in range(len(contrib))]
+        colors = ["#4e79a7"] * len(contrib)
     x = np.arange(len(labels))
 
     plt.figure(figsize=(6, 4))
-    plt.bar(x, contrib, color=["#4e79a7", "#f28e2c", "#e15759"])
+    plt.bar(x, contrib, color=colors)
     plt.xticks(x, labels, rotation=20)
     plt.ylim(0.0, 1.0)
     plt.ylabel("归一化通道贡献")
@@ -661,8 +731,9 @@ def plot_grad_cam(
     stra_now = state[0]
     stra_prev = state[1]
     p_center = state[2]
+    r_norm = state[3]
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
     fig.suptitle(f"{title} | t={t}, L={L}, r={r}", fontsize=12)
 
     im0 = axes[0].imshow(stra_now, vmin=0, vmax=1, cmap="Greens")
@@ -677,10 +748,14 @@ def plot_grad_cam(
     axes[2].set_title("P_center_norm")
     fig.colorbar(im1, ax=axes[2], fraction=0.046, pad=0.04)
 
+    im_r = axes[3].imshow(r_norm, cmap="Purples")
+    axes[3].set_title("R_norm")
+    fig.colorbar(im_r, ax=axes[3], fraction=0.046, pad=0.04)
+
     cam_clean = _clean_heatmap(cam)
-    im2 = axes[3].imshow(cam_clean, cmap="magma", vmin=0.0, vmax=1.0)
-    axes[3].set_title("Grad-CAM (空间注意力)")
-    fig.colorbar(im2, ax=axes[3], fraction=0.046, pad=0.04)
+    im2 = axes[4].imshow(cam_clean, cmap="magma", vmin=0.0, vmax=1.0)
+    axes[4].set_title("Grad-CAM (空间注意力)")
+    fig.colorbar(im2, ax=axes[4], fraction=0.046, pad=0.04)
 
     for ax in axes.ravel():
         ax.set_xticks([])
@@ -780,6 +855,25 @@ def main():
     # 如果没有在命令行或 DEFAULT_CFG 中提供 actor_path，则给出明确提示
     if not args.actor_path:
         raise ValueError("请在 DEFAULT_CFG['actor_path'] 或命令行 --actor-path 中指定 actor.pt 路径")
+
+    args.actor_path = _resolve_path(args.actor_path)
+    if not os.path.exists(args.actor_path):
+        suggestions = _suggest_actor_paths()
+        examples = "\n".join([f"  - {p}" for p in suggestions]) if suggestions else "  (no actors found)"
+        raise FileNotFoundError(
+            "找不到 actor checkpoint 文件。\n"
+            f"- actor_path: {args.actor_path}\n"
+            f"- cwd: {os.getcwd()}\n"
+            "常见原因：你在项目根目录运行脚本，但传的路径是相对 `Without_Dirichlet_determin/` 写的。\n"
+            "建议：\n"
+            "  - 在项目根目录运行：`python Without_Dirichlet_determin/viz_actor.py --actor-path Without_Dirichlet_determin/checkpoints/<run_id>/actor.pt`\n"
+            "  - 在 `Without_Dirichlet_determin/` 目录运行：`python viz_actor.py --actor-path checkpoints/<run_id>/actor.pt`\n"
+            f"现有示例（自动扫描 `Without_Dirichlet_determin/checkpoints/`）：\n{examples}\n"
+        )
+
+    # 输出目录：相对路径默认按本脚本所在目录解析，避免从项目根目录运行时跑到意外位置
+    if not os.path.isabs(args.out_dir):
+        args.out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.out_dir)
 
     # 构造本次运行的子目录名，包含时间戳和关键参数，避免覆盖
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
